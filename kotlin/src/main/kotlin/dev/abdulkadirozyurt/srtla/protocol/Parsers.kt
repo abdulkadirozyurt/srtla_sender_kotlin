@@ -146,14 +146,14 @@ fun parseSrtlaAck(buf: ByteArray): List<Long> {
 // ── Internal read helpers (package-private) ───────────────────────────────────
 
 /** Read a big-endian unsigned 32-bit integer as Long from [buf] at [offset]. */
-internal fun readU32BE(buf: ByteArray, offset: Int): Long =
+fun readU32BE(buf: ByteArray, offset: Int): Long =
     ((buf[offset    ].toLong() and 0xFF) shl 24) or
     ((buf[offset + 1].toLong() and 0xFF) shl 16) or
     ((buf[offset + 2].toLong() and 0xFF) shl  8) or
      (buf[offset + 3].toLong() and 0xFF)
 
 /** Read a big-endian signed 32-bit integer (i32) from [buf] at [offset]. */
-internal fun readI32BE(buf: ByteArray, offset: Int): Int =
+fun readI32BE(buf: ByteArray, offset: Int): Int =
     ((buf[offset    ].toInt() and 0xFF) shl 24) or
     ((buf[offset + 1].toInt() and 0xFF) shl 16) or
     ((buf[offset + 2].toInt() and 0xFF) shl  8) or

@@ -126,26 +126,26 @@ fun createAckPacket(acks: List<Long>): ByteArray {
 
 // ── Internal write helpers (package-private) ──────────────────────────────────
 
-internal fun writeU16BE(buf: ByteArray, offset: Int, value: Int) {
+fun writeU16BE(buf: ByteArray, offset: Int, value: Int) {
     buf[offset    ] = ((value ushr 8) and 0xFF).toByte()
     buf[offset + 1] = (value and 0xFF).toByte()
 }
 
-internal fun writeU32BE(buf: ByteArray, offset: Int, value: Long) {
+fun writeU32BE(buf: ByteArray, offset: Int, value: Long) {
     buf[offset    ] = ((value ushr 24) and 0xFF).toByte()
     buf[offset + 1] = ((value ushr 16) and 0xFF).toByte()
     buf[offset + 2] = ((value ushr  8) and 0xFF).toByte()
     buf[offset + 3] = (value and 0xFF).toByte()
 }
 
-internal fun writeI32BE(buf: ByteArray, offset: Int, value: Int) {
+fun writeI32BE(buf: ByteArray, offset: Int, value: Int) {
     buf[offset    ] = ((value ushr 24) and 0xFF).toByte()
     buf[offset + 1] = ((value ushr 16) and 0xFF).toByte()
     buf[offset + 2] = ((value ushr  8) and 0xFF).toByte()
     buf[offset + 3] = (value and 0xFF).toByte()
 }
 
-internal fun writeU64BE(buf: ByteArray, offset: Int, value: Long) {
+fun writeU64BE(buf: ByteArray, offset: Int, value: Long) {
     buf[offset    ] = ((value ushr 56) and 0xFF).toByte()
     buf[offset + 1] = ((value ushr 48) and 0xFF).toByte()
     buf[offset + 2] = ((value ushr 40) and 0xFF).toByte()
