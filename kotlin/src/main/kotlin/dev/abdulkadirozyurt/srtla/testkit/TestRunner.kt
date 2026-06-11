@@ -1,14 +1,20 @@
 package dev.abdulkadirozyurt.srtla.testkit
 
-// Import all test suites so they register themselves via their top-level suite{} calls.
-// Each test file calls suite() at the top level (file scope), which registers lazily;
-// but Kotlin top-level functions are not called until the class is loaded.
-// We therefore explicitly reference each suite registration object here.
 import dev.abdulkadirozyurt.srtla.tests.registerProtocolTests
+import dev.abdulkadirozyurt.srtla.tests.registerFilterTests
+import dev.abdulkadirozyurt.srtla.tests.registerConnectionTests
+import dev.abdulkadirozyurt.srtla.tests.registerRegistrationTests
+import dev.abdulkadirozyurt.srtla.tests.registerRttTrackerTests
+import dev.abdulkadirozyurt.srtla.tests.registerSenderTests
 
 fun main() {
     // ── Register all suites ──────────────────────────────────────────────────
     registerProtocolTests()
+    registerFilterTests()
+    registerRttTrackerTests()
+    registerConnectionTests()
+    registerRegistrationTests()
+    registerSenderTests()
 
     // ── Run ─────────────────────────────────────────────────────────────────
     println()
