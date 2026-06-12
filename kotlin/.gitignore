@@ -3,3 +3,6 @@ build/
 *.class
 *.jar
 local.properties
+
+# Gradle wrapper jar is intentionally tracked
+!gradle/wrapper/gradle-wrapper.jar

@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     kotlin("jvm") version "2.0.21"
     application
@@ -6,37 +8,36 @@ plugins {
 group = "dev.abdulkadirozyurt"
 version = "0.1.0-SNAPSHOT"
 
+// JVM 11 hedefi; toolchain zorunluluğu yok — JDK 11+ olan her makinede derlenir.
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
 kotlin {
-    jvmToolchain(11)
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_11)
+    }
 }
 
-// Zero external dependencies — only Kotlin stdlib (bundled) + JDK
-// No Maven/Gradle repository access needed in sandbox; this file is for the
-// user's machine.
+// Zero external dependencies — yalnızca Kotlin stdlib (plugin ekler) + JDK.
 repositories {
     mavenCentral()
-}
-
-dependencies {
-    // stdlib is added automatically by the kotlin("jvm") plugin
 }
 
 application {
     mainClass.set("dev.abdulkadirozyurt.srtla.cli.MainKt")
 }
 
-// Also expose testkit runner as a runnable task for sandbox verification
-tasks.register<JavaExec>("runTests") {
+// Bağımlılıksız testkit suite'i (JUnit kullanılmaz).
+val runTests = tasks.register<JavaExec>("runTests") {
     group = "verification"
-    description = "Run zero-dependency testkit suite (no JUnit required)"
-    classpath = sourceSets["main"].runtimeClasspath + sourceSets["test"].runtimeClasspath
+    description = "Run zero-dependency testkit suite (328 tests)"
+    classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("dev.abdulkadirozyurt.srtla.testkit.TestRunnerKt")
-    // Exit code propagates; Gradle will fail the task on non-zero exit
     isIgnoreExitValue = false
 }
 
-sourceSets {
-    test {
-        kotlin.srcDir("src/test/kotlin")
-    }
+// `gradlew test` ve `gradlew build/check` testkit suite'ini koşar.
+tasks.test {
+    dependsOn(runTests)
 }
