@@ -247,15 +247,11 @@ java -cp "srtla-test.jar:$KOTLIN_HOME/lib/kotlin-stdlib.jar" \
 
 Expected output: **328 tests: 328 passed, 0 failed**
 
-### With Gradle (on a machine with internet access)
+### With Gradle (recommended)
 
 ```bash
-
-./gradlew runTests
+./gradlew test        # runs the full testkit suite (alias: ./gradlew runTests)
 ```
-
-> Gradle is not available in the sandbox build environment; the testkit runner
-> above is the primary verification method.
 
 ---
 
