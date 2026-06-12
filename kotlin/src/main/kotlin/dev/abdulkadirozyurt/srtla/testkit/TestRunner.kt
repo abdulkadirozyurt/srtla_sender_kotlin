@@ -6,6 +6,7 @@ import dev.abdulkadirozyurt.srtla.tests.registerConnectionTests
 import dev.abdulkadirozyurt.srtla.tests.registerRegistrationTests
 import dev.abdulkadirozyurt.srtla.tests.registerRttTrackerTests
 import dev.abdulkadirozyurt.srtla.tests.registerSenderTests
+import dev.abdulkadirozyurt.srtla.tests.registerSelectionTests
 
 fun main() {
     // ── Register all suites ──────────────────────────────────────────────────
@@ -15,6 +16,7 @@ fun main() {
     registerConnectionTests()
     registerRegistrationTests()
     registerSenderTests()
+    registerSelectionTests()
 
     // ── Run ─────────────────────────────────────────────────────────────────
     println()
