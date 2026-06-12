@@ -41,6 +41,100 @@ One IP address per line. Comments (`#`) and blank lines are ignored.
 
 ---
 
+## Using as a Library
+
+The sender is a zero-dependency Kotlin/JVM library (Kotlin stdlib + JDK 11+ only),
+so it can be embedded in any JVM or Android project.
+
+### Add the dependency (JitPack)
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven("https://jitpack.io")
+    }
+}
+
+// build.gradle.kts
+dependencies {
+    implementation("com.github.abdulkadirozyurt:srtla_sender_kotlin:<tag-or-commit>")
+}
+```
+
+Any git tag, branch (`main-SNAPSHOT`) or commit hash works as the version.
+Alternatively, add this repo as a git submodule / included build — there are no
+transitive dependencies to manage.
+
+### Embedding example
+
+```kotlin
+import dev.abdulkadirozyurt.srtla.config.DynamicConfig
+import dev.abdulkadirozyurt.srtla.config.applyCmd
+import dev.abdulkadirozyurt.srtla.sender.Housekeeping
+import dev.abdulkadirozyurt.srtla.sender.SrtlaSender
+import dev.abdulkadirozyurt.srtla.sender.selection.SchedulingMode
+import dev.abdulkadirozyurt.srtla.stats.SharedStats
+import java.net.InetAddress
+
+// 1. Runtime-tunable configuration (thread-safe, atomics-based)
+val config = DynamicConfig.fromCli(mode = SchedulingMode.ENHANCED)
+val stats  = SharedStats()
+
+// 2. Create the sender: local SRT ingest port -> SRTLA receiver, over N uplinks
+val sender = SrtlaSender(
+    localSrtPort = 6000,                       // your SRT encoder sends to udp://127.0.0.1:6000
+    receiverHost = "receiver.example.com",     // srtla_rec host
+    receiverPort = 5000,
+    sourceIps    = listOf(
+        InetAddress.getByName("192.168.0.2"),  // uplink 1 (e.g. modem A)
+        InetAddress.getByName("192.168.1.2"),  // uplink 2 (e.g. modem B)
+    ),
+    config = config.snapshot(),
+    // socketFactory = ...                     // see Android Integration below
+)
+sender.start()
+
+// 3. Housekeeping loop (keepalives, timeouts, window recovery, stats refresh).
+//    Run on your own scheduler/thread; tick every ~100 ms.
+var lastStatusLogMs = 0L
+val housekeeper = Thread {
+    while (!Thread.currentThread().isInterrupted) {
+        lastStatusLogMs = Housekeeping.tick(sender, config, stats, lastStatusLogMs)
+        Thread.sleep(100)
+    }
+}.apply { isDaemon = true; start() }
+
+// 4. Observe per-link telemetry (bitrate, RTT, window, in-flight, quality)
+val snapshot = stats.get()        // typed snapshot
+val json     = stats.toJson()     // or JSON for UI/IPC
+
+// 5. Change behaviour at runtime — same commands as the CLI control channel
+applyCmd(config, "mode rtt-threshold")
+applyCmd(config, "rtt-delta 50")
+applyCmd(config, "quality off")
+
+// 6. Shutdown
+housekeeper.interrupt()
+sender.stop()
+```
+
+Point your SRT encoder (FFmpeg, OBS, RootEncoder, srt-live-transmit, ...) at
+`srt://127.0.0.1:6000` in caller mode; the sender bonds the traffic across all
+uplinks towards the SRTLA receiver.
+
+### Using from an Android app
+
+Everything above works on Android (minSdk with JDK-11 desugaring not required —
+the library uses only `java.nio` and `java.util.concurrent`). Two Android-specific
+concerns are covered in [Android Integration](#android-integration):
+
+- bind each uplink to a specific `Network` (Wi-Fi + cellular simultaneously) by
+  injecting a custom `UplinkSocketFactory` backed by `ConnectivityManager`
+- request the cellular network with `requestNetwork` while Wi-Fi is up, and run
+  the sender inside a foreground service for IRL streaming use cases
+
 ## CLI Arguments
 
 | Argument | Default | Description |

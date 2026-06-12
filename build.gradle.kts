@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     kotlin("jvm") version "2.0.21"
     application
+    `maven-publish`
 }
 
 group = "dev.abdulkadirozyurt"
@@ -12,6 +13,17 @@ version = "0.1.0-SNAPSHOT"
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
+    withSourcesJar()
+}
+
+// JitPack publishing: com.github.abdulkadirozyurt:srtla_sender_kotlin:<tag>
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["java"])
+            artifactId = "srtla-sender-kotlin"
+        }
+    }
 }
 kotlin {
     compilerOptions {
