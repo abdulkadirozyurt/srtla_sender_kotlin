@@ -32,7 +32,9 @@ import dev.abdulkadirozyurt.srtla.connection.UplinkSocketFactory
 import dev.abdulkadirozyurt.srtla.connection.DefaultUplinkSocketFactory
 import dev.abdulkadirozyurt.srtla.protocol.*
 import dev.abdulkadirozyurt.srtla.registration.RegistrationManager
-import dev.abdulkadirozyurt.srtla.sender.selection.selectConnectionIdx
+import dev.abdulkadirozyurt.srtla.sender.selection.ConfigSnapshot
+import dev.abdulkadirozyurt.srtla.sender.selection.SchedulingMode
+import dev.abdulkadirozyurt.srtla.sender.selection.SelectionOrchestrator
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -67,7 +69,7 @@ class SrtlaSender(
     private val receiverHost: String,
     private val receiverPort: Int,
     private val sourceIps: List<InetAddress>,
-    private val classicMode: Boolean = true,
+    private val config: ConfigSnapshot = ConfigSnapshot(),
     private val socketFactory: UplinkSocketFactory = DefaultUplinkSocketFactory,
 ) {
     // ── Shared state (protected by stateLock) ────────────────────────────────
@@ -77,6 +79,7 @@ class SrtlaSender(
     private var lastSelectedIdx: Int? = null
     private var lastSwitchMs: Long = 0L
     private val seqTracker = SequenceTracker()
+    private val selectionOrchestrator = SelectionOrchestrator()
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
     private val running = AtomicBoolean(false)
@@ -171,7 +174,7 @@ class SrtlaSender(
             // Pre-registration: pick any non-timed-out connection
             selectPreRegistration()
         } else {
-            selectConnectionIdx(connections, lastSelectedIdx, lastSwitchMs, now, classicMode)
+            selectionOrchestrator.select(connections, lastSelectedIdx, lastSwitchMs, now, config)
         }
 
         if (selIdx == null) return
@@ -294,7 +297,7 @@ class SrtlaSender(
                 val acks = parseSrtlaAck(buf)
                 for (seq in acks) {
                     for (c in connections) {
-                        if (c.handleSrtlaAckSpecific(seq, classicMode)) break
+                        if (c.handleSrtlaAckSpecific(seq, config.mode.isClassic())) break
                     }
                     for (c in connections) c.handleSrtlaAckGlobal()
                 }
@@ -358,7 +361,7 @@ class SrtlaSender(
 
             if (conn.needsKeepalive()) conn.sendKeepalive()
             if (conn.needsRttMeasurement()) conn.sendKeepalive()
-            if (!classicMode) conn.performWindowRecovery()
+            if (!config.mode.isClassic()) conn.performWindowRecovery()
             conn.calculateBitrate()
         }
 

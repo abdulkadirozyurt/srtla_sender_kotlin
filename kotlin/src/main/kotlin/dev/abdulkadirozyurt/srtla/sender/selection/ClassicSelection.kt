@@ -1,5 +1,5 @@
 // Ported from irlserver/srtla_send v3.0.0 (MIT)
-// Source: src/sender/selection/classic.rs
+// Source: src/sender/selection/classic.rs + src/sender/selection/mod.rs
 //
 // Classic connection selection algorithm — matches original C implementation exactly.
 //
@@ -25,6 +25,7 @@ object ClassicSelection : SelectionStrategy {
     /**
      * Select the connection with the highest capacity score.
      * Returns null if all connections are timed out or have score -1 (disconnected).
+     * lastIdx / lastSwitchMs / currentTimeMs are ignored — classic has no dampening.
      */
     override fun select(
         conns: List<SrtlaConnection>,
@@ -47,11 +48,13 @@ object ClassicSelection : SelectionStrategy {
 }
 
 /**
- * Top-level dispatch helper used by SrtlaSender.
- * Classic mode: always calls ClassicSelection (no dampening).
- * Enhanced / other modes: Faz C will fill these branches.
+ * Top-level stateless dispatch helper — used only by tests that don't yet hold
+ * a SelectionOrchestrator.  SrtlaSender uses SelectionOrchestrator.select()
+ * directly.
  *
  * Mirrors Rust `select_connection_idx` in src/sender/selection/mod.rs.
+ *
+ * @param classicMode  If true → ClassicSelection; otherwise Enhanced (default config).
  */
 fun selectConnectionIdx(
     conns: List<SrtlaConnection>,
@@ -60,11 +63,12 @@ fun selectConnectionIdx(
     currentTimeMs: Long,
     classicMode: Boolean,
 ): Int? {
-    return if (classicMode) {
-        ClassicSelection.select(conns, lastIdx, lastSwitchMs, currentTimeMs)
+    val config = if (classicMode) {
+        ConfigSnapshot(mode = SchedulingMode.CLASSIC)
     } else {
-        // Enhanced / other modes stubbed here — Faz C will replace with full implementation.
-        // For now fall through to classic so Faz B tests pass.
-        ClassicSelection.select(conns, lastIdx, lastSwitchMs, currentTimeMs)
+        ConfigSnapshot(mode = SchedulingMode.ENHANCED)
     }
+    // Create a short-lived orchestrator for test dispatch.
+    // Production code uses the stateful orchestrator in SrtlaSender.
+    return SelectionOrchestrator().select(conns, lastIdx, lastSwitchMs, currentTimeMs, config)
 }
