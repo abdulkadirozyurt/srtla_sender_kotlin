@@ -6,3 +6,4 @@ local.properties
 
 # Gradle wrapper jar is intentionally tracked
 !gradle/wrapper/gradle-wrapper.jar
+.vscode/
