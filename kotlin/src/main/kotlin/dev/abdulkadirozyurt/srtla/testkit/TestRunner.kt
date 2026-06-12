@@ -1,3 +1,6 @@
+// Ported from irlserver/srtla_send v3.0.0 (MIT)
+// Copyright (c) 2025-2026 Abdulkadir Özyurt
+// Test suite runner — registers all suites and runs them via the zero-dependency testkit.
 package dev.abdulkadirozyurt.srtla.testkit
 
 import dev.abdulkadirozyurt.srtla.tests.registerProtocolTests
@@ -11,6 +14,8 @@ import dev.abdulkadirozyurt.srtla.tests.registerSelectionTests
 import dev.abdulkadirozyurt.srtla.tests.registerConfigTests
 import dev.abdulkadirozyurt.srtla.tests.registerStatsTests
 import dev.abdulkadirozyurt.srtla.tests.registerCliArgTests
+// Faz E — E2E suites
+import dev.abdulkadirozyurt.srtla.e2e.registerE2ETests
 
 fun main() {
     // ── Register all suites ──────────────────────────────────────────────────
@@ -25,6 +30,8 @@ fun main() {
     registerConfigTests()
     registerStatsTests()
     registerCliArgTests()
+    // Faz E — E2E
+    registerE2ETests()
 
     // ── Run ─────────────────────────────────────────────────────────────────
     println()
