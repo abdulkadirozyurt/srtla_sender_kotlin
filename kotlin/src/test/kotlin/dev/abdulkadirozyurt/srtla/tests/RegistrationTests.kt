@@ -102,13 +102,15 @@ suite("RegErrHandling") {
             it[0] = (SRTLA_TYPE_REG_ERR ushr 8).toByte()
             it[1] = (SRTLA_TYPE_REG_ERR and 0xFF).toByte()
         }
+        val before = System.currentTimeMillis()
         val event = reg.processRegistrationPacket(1, buf)
         assertNotNull(event)
-        val after = System.currentTimeMillis()
         assertNull(reg.pendingReg2Idx())
         assertEquals(0L, reg.pendingTimeoutAtMs)
         assertNull(reg.reg1TargetIdx)
-        assertTrue(reg.reg1NextSendAtMs >= after + REG2_TIMEOUT * 1000L)
+        // 'before' is captured BEFORE processing: on Windows the ~16ms clock
+        // granularity made an after-captured timestamp overshoot the deadline.
+        assertTrue(reg.reg1NextSendAtMs >= before + REG2_TIMEOUT * 1000L)
     }
 }
 
