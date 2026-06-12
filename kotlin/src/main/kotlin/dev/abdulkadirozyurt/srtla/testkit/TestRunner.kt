@@ -7,6 +7,10 @@ import dev.abdulkadirozyurt.srtla.tests.registerRegistrationTests
 import dev.abdulkadirozyurt.srtla.tests.registerRttTrackerTests
 import dev.abdulkadirozyurt.srtla.tests.registerSenderTests
 import dev.abdulkadirozyurt.srtla.tests.registerSelectionTests
+// Faz D test suites
+import dev.abdulkadirozyurt.srtla.tests.registerConfigTests
+import dev.abdulkadirozyurt.srtla.tests.registerStatsTests
+import dev.abdulkadirozyurt.srtla.tests.registerCliArgTests
 
 fun main() {
     // ── Register all suites ──────────────────────────────────────────────────
@@ -17,6 +21,10 @@ fun main() {
     registerRegistrationTests()
     registerSenderTests()
     registerSelectionTests()
+    // Faz D
+    registerConfigTests()
+    registerStatsTests()
+    registerCliArgTests()
 
     // ── Run ─────────────────────────────────────────────────────────────────
     println()

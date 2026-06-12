@@ -400,4 +400,7 @@ class SrtlaSender(
     fun activeConnectionCount(): Int = stateLock.withLock { connections.count { it.connected } }
     fun getConnections(): List<SrtlaConnection> = stateLock.withLock { connections.toList() }
     fun getRegistrationManager(): RegistrationManager = reg
+    fun getLastSelectedIdx(): Int? = stateLock.withLock { lastSelectedIdx }
 }
+
+// Faz D accessor — needed by Housekeeping.tick() and Status.logConnectionStatus()
