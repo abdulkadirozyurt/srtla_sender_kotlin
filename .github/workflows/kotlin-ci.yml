@@ -13,4 +13,6 @@ jobs:
           distribution: temurin
           java-version: "17"
       - name: Run testkit suite via Gradle
-        run: ./gradlew --no-daemon test
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon test
