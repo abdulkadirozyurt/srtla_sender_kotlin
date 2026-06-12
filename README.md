@@ -11,7 +11,7 @@ v3.0.0 — a multi-uplink SRTLA bonding sender.
 
 ```bash
 # Compile all sources
-kotlinc $(find kotlin/src -name "*.kt") -d srtla.jar
+kotlinc $(find src -name "*.kt") -d srtla.jar
 
 # Or with Gradle (on a machine with internet / Gradle cache)
 ./gradlew build
@@ -238,7 +238,7 @@ The `SRTLA_LOG` environment variable is not used; configure via the JUL API abov
 
 ```bash
 # Compile
-kotlinc $(find kotlin/src -name "*.kt") -d srtla-test.jar
+kotlinc $(find src -name "*.kt") -d srtla-test.jar
 
 # Run
 java -cp "srtla-test.jar:$KOTLIN_HOME/lib/kotlin-stdlib.jar" \
@@ -250,7 +250,7 @@ Expected output: **328 tests: 328 passed, 0 failed**
 ### With Gradle (on a machine with internet access)
 
 ```bash
-cd kotlin
+
 ./gradlew runTests
 ```
 

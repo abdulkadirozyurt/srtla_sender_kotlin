@@ -37,7 +37,7 @@ are required at runtime.
 
 ## Port Scope
 
-Files ported (under `kotlin/src/main/kotlin/dev/abdulkadirozyurt/srtla/`):
+Files ported (under `src/main/kotlin/dev/abdulkadirozyurt/srtla/`):
 
 | Kotlin module | Rust source(s) |
 |---|---|
