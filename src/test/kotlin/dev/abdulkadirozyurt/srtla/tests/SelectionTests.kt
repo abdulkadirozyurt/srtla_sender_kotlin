@@ -1,771 +1,690 @@
-// Ported from irlserver/srtla_send v3.0.0 (MIT)
-// Source: src/tests/rtt_threshold_tests.rs + src/tests/sender_tests.rs (quality/enhanced)
-//         + src/sender/selection/blest.rs #[cfg(test)] + iods.rs #[cfg(test)]
-//
-// Full Faz C selection test suite: Quality, Enhanced, RttThreshold, Blest, Iods, Edpf,
-// SelectionOrchestrator, SchedulingMode.
+// Ported from irlserver/srtla_send v4.1.0 (MIT)
+// Source: crates/srtla-core/src/selection/mod.rs, enhanced.rs, classifier.rs
 package dev.abdulkadirozyurt.srtla.tests
 
-import dev.abdulkadirozyurt.srtla.connection.*
-import dev.abdulkadirozyurt.srtla.connection.congestion.CongestionControl
-import dev.abdulkadirozyurt.srtla.sender.selection.*
+import dev.abdulkadirozyurt.srtla.core.ConfigSnapshot
+import dev.abdulkadirozyurt.srtla.core.SchedulingMode
+import dev.abdulkadirozyurt.srtla.core.nowMs
+import dev.abdulkadirozyurt.srtla.selection.*
 import dev.abdulkadirozyurt.srtla.testkit.*
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.nio.channels.DatagramChannel
-import kotlin.math.exp
-import kotlin.math.abs
-
-// ── Test connection factory ───────────────────────────────────────────────────
-
-private fun makeSelConn(
-    inFlight: Int = 0,
-    connected: Boolean = true,
-    smoothRtt: Double = 0.0,   // Kalman value
-    rttMin: Double = 0.0,
-    bitrateBps: Double = 0.0,
-    nakCount: Int = 0,
-    lastNakAgoMs: Long = 0L,
-    nakBurst: Int = 0,
-    connEstAgoMs: Long = 0L,   // 0 = startup grace (fresh); >30000 = beyond grace
-): SrtlaConnection {
-    val ch = DatagramChannel.open()
-    ch.configureBlocking(false)
-    ch.socket().bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
-    val port = ch.socket().localPort
-    ch.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), port))
-    val now = System.currentTimeMillis()
-    val conn = SrtlaConnection(
-        connId     = System.nanoTime(),
-        socket     = UplinkSocket(ch),
-        remoteAddr = InetSocketAddress(InetAddress.getLoopbackAddress(), port),
-        localIp    = InetAddress.getLoopbackAddress(),
-        label      = "test-${System.nanoTime()}",
-    )
-    conn.connected = connected
-    conn.lastReceivedMs = if (connected) now else 0L
-    conn.inFlightPackets = inFlight
-    if (smoothRtt > 0.0) conn.rtt.kalmanRtt.update(smoothRtt)
-    if (rttMin > 0.0) conn.rtt.rttMinMs = rttMin
-    if (bitrateBps > 0.0) conn.bitrate.currentBitrateBps = bitrateBps
-    conn.congestion.nakCount = nakCount
-    if (nakCount > 0 && lastNakAgoMs > 0L) {
-        conn.congestion.lastNakTimeMs = now - lastNakAgoMs
-    }
-    conn.congestion.nakBurstCount = nakBurst
-    if (connEstAgoMs > 0L) {
-        conn.reconnection.connectionEstablishedMs = now - connEstAgoMs
-    }
-    return conn
-}
 
 fun registerSelectionTests() {
+    suite("Selection (mod.rs)") {
+        test("test_select_connection_idx_classic") {
+            // Test that classic mode always picks highest score
+            val connections = createTestConnections(3)
+            connections[0].inFlightPackets = 5 // Lower score
+            connections[1].inFlightPackets = 0 // Highest score
+            connections[2].inFlightPackets = 10 // Lowest score
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Quality scoring tests (mirrors src/tests/sender_tests.rs::test_calculate_quality_multiplier)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("QualityScoring") {
-
-    test("perfect connection (no NAKs, past grace) → 1.1 bonus") {
-        val conn = makeSelConn(connEstAgoMs = 35_000L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        assertEquals(PERFECT_CONNECTION_BONUS, m)
-    }
-
-    test("startup grace, no NAKs → 1.1 bonus") {
-        // connEstAgoMs=100 → established 100ms ago → inside 30s grace period
-        val conn = makeSelConn(connEstAgoMs = 100L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        // During startup grace with zero NAKs → PERFECT_CONNECTION_BONUS
-        assertEquals(PERFECT_CONNECTION_BONUS, m)
-    }
-
-    test("startup grace, with NAKs → 0.98 light penalty") {
-        // connEstAgoMs=100 → established 100ms ago → well within 30s grace period
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 100L, connEstAgoMs = 100L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        assertEquals(STARTUP_NAK_PENALTY, m)
-    }
-
-    test("nak 500ms ago → ~0.61 (exponential decay)") {
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 500L, connEstAgoMs = 35_000L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        // expected: 1 - 0.5*exp(-500/2000) = 1 - 0.5*0.7788 ≈ 0.6106
-        val expected = 1.0 - MAX_PENALTY * exp(-500.0 / HALF_LIFE_MS)
-        assertTrue(abs(m - expected) < 0.02,
-            "Expected ~${expected}, got $m")
-    }
-
-    test("nak 2000ms ago (half-life) → ~0.816") {
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 2_000L, connEstAgoMs = 35_000L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        val expected = 1.0 - MAX_PENALTY * exp(-2000.0 / HALF_LIFE_MS)
-        assertTrue(abs(m - expected) < 0.02, "Expected ~${expected}, got $m")
-    }
-
-    test("nak 5000ms ago → ~0.96") {
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 5_000L, connEstAgoMs = 35_000L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        val expected = 1.0 - MAX_PENALTY * exp(-5000.0 / HALF_LIFE_MS)
-        assertTrue(abs(m - expected) < 0.02, "Expected ~${expected}, got $m")
-    }
-
-    test("nak 15000ms ago → ~1.0 (recovered)") {
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 15_000L, connEstAgoMs = 35_000L)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        val expected = 1.0 - MAX_PENALTY * exp(-15000.0 / HALF_LIFE_MS)
-        assertTrue(abs(m - expected) < 0.02, "Expected ~${expected}, got $m")
-    }
-
-    test("burst: ≥5 NAKs within 3s adds 0.7x extra penalty") {
-        // at 2000ms: base ≈ 0.816, × 0.7 burst ≈ 0.571
-        val conn = makeSelConn(
-            nakCount = 5, lastNakAgoMs = 2_000L, nakBurst = 5,
-            connEstAgoMs = 35_000L
-        )
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        val base = 1.0 - MAX_PENALTY * exp(-2000.0 / HALF_LIFE_MS)
-        val expected = base * NAK_BURST_PENALTY
-        assertTrue(abs(m - expected) < 0.02, "Expected ~$expected, got $m")
-    }
-
-    test("burst age > 3s: no burst penalty applied") {
-        // burst is old (4s ago) → no extra penalty
-        val conn = makeSelConn(
-            nakCount = 5, lastNakAgoMs = 4_000L, nakBurst = 5,
-            connEstAgoMs = 35_000L
-        )
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        val expected = 1.0 - MAX_PENALTY * exp(-4000.0 / HALF_LIFE_MS)
-        // Should be close to base without burst penalty
-        assertTrue(abs(m - expected) < 0.02, "Expected ~$expected (no burst), got $m")
-    }
-
-    test("QualityCache: caches and returns stable value within 50ms") {
-        val conn = makeSelConn(connEstAgoMs = 35_000L)
-        val cache = QualityCache()
-        val now = System.currentTimeMillis()
-        val v1 = cache.get(conn, now)
-        val v2 = cache.get(conn, now + 30L) // within 50ms → same cached value
-        assertEquals(v1, v2)
-    }
-
-    test("QualityCache: recalculates after 50ms") {
-        val conn = makeSelConn(nakCount = 1, lastNakAgoMs = 500L, connEstAgoMs = 35_000L)
-        val cache = QualityCache()
-        val t0 = System.currentTimeMillis()
-        cache.get(conn, t0)
-        // Advance 51ms — should recompute
-        val v2 = cache.get(conn, t0 + 51L)
-        assertTrue(v2 > 0.0) // just ensure it ran without exception
-    }
-
-    test("RTT bonus: fast RTT (50ms) → 1.03 cap") {
-        // conn with no NAKs, past grace, Kalman RTT = 50ms
-        val conn = makeSelConn(connEstAgoMs = 35_000L, smoothRtt = 50.0)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        // perfect bonus is 1.1, RTT bonus capped at 1.03, applied on top of perfect bonus
-        // actual perfect path: qualityMult=1.1, rttBonus= min(200/max(50,50), 1.03)=1.03 → 1.1*1.03
-        val expected = PERFECT_CONNECTION_BONUS * MAX_RTT_BONUS
-        assertTrue(abs(m - expected) < 0.02, "Expected ~$expected, got $m")
-    }
-
-    test("RTT bonus: slow RTT (400ms) → no bonus (1.0)") {
-        val conn = makeSelConn(connEstAgoMs = 35_000L, smoothRtt = 400.0)
-        val now = System.currentTimeMillis()
-        val m = calculateQualityMultiplier(conn, now)
-        // rttFactor = min(200/400, 1.03) = 0.5 → coerced to 1.0 (never penalty)
-        // perfect bonus × 1.0
-        val expected = PERFECT_CONNECTION_BONUS * 1.0
-        assertTrue(abs(m - expected) < 0.02, "Expected ~$expected, got $m")
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Enhanced selection tests (src/tests/sender_tests.rs enhanced tests)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("EnhancedSelection") {
-
-    test("picks highest quality-adjusted score") {
-        val c0 = makeSelConn(inFlight = 0, connEstAgoMs = 35_000L, nakCount = 0)
-        val c1 = makeSelConn(inFlight = 0, connEstAgoMs = 35_000L, nakCount = 5,
-            lastNakAgoMs = 1_000L)  // has recent NAKs → lower quality
-        val c2 = makeSelConn(inFlight = 0, connEstAgoMs = 35_000L, nakCount = 0) // perfect
-        val conns = listOf(c0, c1, c2)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = true)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        // c0 and c2 both have equal quality (1.1), c1 is degraded
-        assertTrue(sel == 0 || sel == 2, "Expected c0 or c2, got $sel")
-    }
-
-    test("cooldown: stays with current connection within MIN_SWITCH_INTERVAL_MS") {
-        val c0 = makeSelConn(inFlight = 5)  // currently selected, lower score
-        val c1 = makeSelConn(inFlight = 0)  // better score
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val lastSwitch = now - 5L // 5ms ago, within 15ms cooldown
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED)
-        val sel = orch.select(conns, 0, lastSwitch, now, cfg)
-        assertEquals(0, sel, "Should stay with conn 0 during cooldown")
-    }
-
-    test("after cooldown: switches to better connection") {
-        val c0 = makeSelConn(inFlight = 5)  // currently selected, lower score
-        val c1 = makeSelConn(inFlight = 0)  // better score
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val lastSwitch = now - 20L // 20ms ago, past 15ms cooldown
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED)
-        // Need score difference > 10% hysteresis:
-        // c0 score = window/(5+1), c1 score = window/1 → c1 is much better
-        val sel = orch.select(conns, 0, lastSwitch, now, cfg)
-        assertEquals(1, sel, "Should switch to conn 1 after cooldown")
-    }
-
-    test("hysteresis: does not switch when improvement < 10%") {
-        // c0 and c1 have nearly equal scores (< 10% difference)
-        val w = 100 // small window to control scores
-        val c0 = makeSelConn(inFlight = 0).also { it.window = w }
-        val c1 = makeSelConn(inFlight = 0).also { it.window = (w * 1.05).toInt() }
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val lastSwitch = now - 20L // past cooldown
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = false)
-        val sel = orch.select(conns, 0, lastSwitch, now, cfg)
-        // c1 is only 5% better → hysteresis keeps c0
-        assertEquals(0, sel, "Hysteresis should keep current when improvement < 10%")
-    }
-
-    test("all disconnected → null") {
-        val conns = listOf(makeSelConn(connected = false), makeSelConn(connected = false))
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED)
-        val sel = orch.select(conns, null, 0L, System.currentTimeMillis(), cfg)
-        assertNull(sel)
-    }
-
-    test("exploration: periodic trigger at 30s boundary") {
-        // We cannot easily control elapsed time, so just verify no crash
-        val c0 = makeSelConn(inFlight = 0)
-        val c1 = makeSelConn(inFlight = 5)
-        val conns = listOf(c0, c1)
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED,
-            qualityEnabled = false, explorationEnabled = true)
-        // Should not throw regardless of which branch is taken
-        val sel = orch.select(conns, null, 0L, System.currentTimeMillis(), cfg)
-        assertNotNull(sel)
-    }
-
-    test("quality disabled: selects by base capacity only") {
-        val c0 = makeSelConn(inFlight = 0, connEstAgoMs = 35_000L,
-            nakCount = 100, lastNakAgoMs = 100L) // terrible NAK history
-        val c1 = makeSelConn(inFlight = 1, connEstAgoMs = 35_000L) // slightly lower cap
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = false)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        // Without quality, c0 (inFlight=0) has higher base score
-        assertEquals(0, sel, "Quality disabled: should pick highest base score")
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RTT-threshold tests (mirrors src/tests/rtt_threshold_tests.rs)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("RttThresholdSelection") {
-
-    test("prefers fast link (low RTT)") {
-        // Connection 0: 50ms RTT (fast), Connection 1: 200ms (slow with 30ms delta)
-        val c0 = makeSelConn(inFlight = 0, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 200.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD,
-            qualityEnabled = true, rttDeltaMs = 30)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(0, sel, "Should prefer fast link (50ms RTT)")
-    }
-
-    test("both fast → picks better capacity") {
-        // c0: 50ms, c1: 70ms (both within 50+30=80ms threshold)
-        val c0 = makeSelConn(inFlight = 5, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 70.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, rttDeltaMs = 30)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(1, sel, "Among fast links, should pick higher capacity")
-    }
-
-    test("fallback when fast link is saturated (score 0)") {
-        // c0: fast but saturated (window=0), c1: slow but has capacity
-        val c0 = makeSelConn(smoothRtt = 50.0).also {
-            it.window = 0; it.inFlightPackets = 10
+            val config = ConfigSnapshot(mode = SchedulingMode.CLASSIC, qualityEnabled = false)
+            val result = selectConnectionIdx(connections, 0, nowMs(), config)
+            assertEquals(1, result, "Classic mode should pick highest score connection")
         }
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 200.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, rttDeltaMs = 30)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(1, sel, "Should fallback to slow link when fast is saturated")
-    }
 
-    test("quality within fast links: prefers cleaner connection") {
-        // Two fast links, c0 has recent NAKs, c1 is clean
-        val c0 = makeSelConn(inFlight = 0, smoothRtt = 50.0,
-            nakCount = 5, lastNakAgoMs = 1_000L, connEstAgoMs = 35_000L)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 60.0,
-            nakCount = 0, connEstAgoMs = 35_000L)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD,
-            qualityEnabled = true, rttDeltaMs = 30)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(1, sel, "Should prefer cleaner connection within fast group")
-    }
+        test("test_enhanced_switches_immediately_when_clearly_better") {
+            // Regression guard for the removed switch cooldown. Selection must be
+            // free to re-decide on every packet: `getScore()` counts queued packets
+            // as in-flight, so routing a packet de-prioritises its own link.
+            val connections = createTestConnections(3)
+            connections[0].inFlightPackets = 5 // Currently selected, lower score
+            connections[1].inFlightPackets = 0 // Far better score
+            connections[2].inFlightPackets = 10 // Lowest score
 
-    test("no RTT data → all links treated as fast, picks by capacity") {
-        // Both links have RTT=0 (no data) → both fast → higher capacity wins
-        val c0 = makeSelConn(inFlight = 5) // lower score
-        val c1 = makeSelConn(inFlight = 0) // higher score
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, rttDeltaMs = 30)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(1, sel, "Without RTT data, should pick higher capacity")
-    }
-
-    test("large delta → all links fast → picks best capacity") {
-        val c0 = makeSelConn(inFlight = 5, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 150.0)
-        val c2 = makeSelConn(inFlight = 3, smoothRtt = 200.0)
-        val conns = listOf(c0, c1, c2)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        // With delta=200: threshold = 50+200=250ms → all fast
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, rttDeltaMs = 200)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(1, sel, "With large delta, all fast → pick best capacity (conn 1)")
-    }
-
-    test("time-based dampening: stays within cooldown") {
-        val c0 = makeSelConn(inFlight = 5, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 50.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val lastSwitch = now - 5L // 5ms ago, within 15ms cooldown
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD)
-        val sel = orch.select(conns, 0, lastSwitch, now, cfg)
-        assertEquals(0, sel, "Should stay with current during cooldown")
-    }
-
-    test("after cooldown: switches to better link") {
-        val c0 = makeSelConn(inFlight = 5, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0, smoothRtt = 50.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val lastSwitch = now - 20L // past cooldown
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD)
-        val sel = orch.select(conns, 0, lastSwitch, now, cfg)
-        assertEquals(1, sel, "Should switch after cooldown expires")
-    }
-
-    test("empty connections → null") {
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD)
-        val sel = orch.select(emptyList(), null, 0L, System.currentTimeMillis(), cfg)
-        assertNull(sel)
-    }
-
-    test("all timed out → null") {
-        val c0 = makeSelConn(connected = false)
-        val c1 = makeSelConn(connected = false)
-        val conns = listOf(c0, c1)
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD)
-        val sel = orch.select(conns, null, 0L, System.currentTimeMillis(), cfg)
-        assertNull(sel)
-    }
-
-    test("quality disabled: picks by base capacity only") {
-        // c0: fast, high in-flight (bad NAK history but doesn't matter)
-        val c0 = makeSelConn(inFlight = 0, smoothRtt = 50.0,
-            nakCount = 100, lastNakAgoMs = 100L, connEstAgoMs = 35_000L)
-        val c1 = makeSelConn(inFlight = 1, smoothRtt = 50.0)
-        val conns = listOf(c0, c1)
-        val now = System.currentTimeMillis()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, qualityEnabled = false)
-        val sel = orch.select(conns, null, 0L, now, cfg)
-        assertEquals(0, sel, "Quality disabled: picks best base score")
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// BLEST filter tests (mirrors src/sender/selection/blest.rs #[cfg(test)])
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("BlestFilter") {
-
-    test("all close RTTs → all pass") {
-        val conns = listOf(
-            makeSelConn(rttMin = 40.0),
-            makeSelConn(rttMin = 50.0),
-            makeSelConn(rttMin = 60.0),
-        )
-        val filter = BlestFilter()
-        val result = filter.filter(conns)
-        assertEquals(listOf(0, 1, 2), result, "All should pass with close RTTs")
-    }
-
-    test("high OWD link is filtered out") {
-        // c0: rttMin=20 → OWD=10; c1: rttMin=40 → OWD=20, blockTime=10<50 → pass
-        // c2: rttMin=180 → OWD=90, blockTime=80>50 → blocked
-        val conns = listOf(
-            makeSelConn(rttMin = 20.0),
-            makeSelConn(rttMin = 40.0),
-            makeSelConn(rttMin = 180.0),
-        )
-        val filter = BlestFilter()
-        val result = filter.filter(conns)
-        assertEquals(listOf(0, 1), result, "High-OWD link should be filtered out")
-    }
-
-    test("rttMin ≥ 200 excluded from min-OWD calc") {
-        // rttMin=200 is excluded from min calc; so only c0 (rttMin=20) determines min
-        val conns = listOf(
-            makeSelConn(rttMin = 20.0),
-            makeSelConn(rttMin = 200.0),
-        )
-        val filter = BlestFilter()
-        val result = filter.filter(conns)
-        // c1: rttMin=200, OWD=100, blockTime=90 > 50 → filtered
-        assertEquals(listOf(0), result)
-    }
-
-    test("no valid RTT data → all connected links returned") {
-        val c0 = makeSelConn() // rttMin=0 (no data)
-        val c1 = makeSelConn()
-        val filter = BlestFilter()
-        val result = filter.filter(listOf(c0, c1))
-        assertEquals(listOf(0, 1), result)
-    }
-
-    test("disconnected link excluded") {
-        val c0 = makeSelConn()
-        val c1 = makeSelConn(connected = false)
-        val filter = BlestFilter()
-        val result = filter.filter(listOf(c0, c1))
-        assertEquals(listOf(0), result)
-    }
-
-    test("penalty shrinks effective threshold") {
-        val filter = BlestFilter()
-        val defaultThreshold = filter.effectiveThreshold()
-        assertTrue(abs(defaultThreshold - BLEST_DEFAULT_BLOCK_THRESHOLD_MS) < 0.01)
-
-        filter.recordBlocking()
-        // penalty=1.0, threshold = 50 / (1 + 0.5) = 33.3
-        val penalized = filter.effectiveThreshold()
-        assertTrue(penalized < BLEST_DEFAULT_BLOCK_THRESHOLD_MS, "Penalty should reduce threshold")
-        assertTrue(penalized > 30.0)
-    }
-
-    test("penalty decays to near zero after many ticks") {
-        val filter = BlestFilter()
-        filter.recordBlocking()
-        assertTrue(filter.penalty > 0.0)
-        repeat(200) { filter.tick() }
-        assertTrue(filter.penalty < 0.01, "Penalty should decay: ${filter.penalty}")
-    }
-
-    test("tick: penalty × 0.95 each tick") {
-        val filter = BlestFilter()
-        filter.recordBlocking() // penalty = 1.0
-        filter.tick()           // penalty = 0.95
-        assertTrue(abs(filter.penalty - 0.95) < 0.001)
-    }
-
-    test("empty connections → empty result") {
-        val filter = BlestFilter()
-        assertEquals(emptyList<Int>(), filter.filter(emptyList()))
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// IoDS filter tests (mirrors src/sender/selection/iods.rs #[cfg(test)])
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("IodsFilter") {
-
-    test("initially all candidates pass (lastArrival=0)") {
-        val iods = IodsFilter()
-        val arrivals = listOf(0.1, 0.05, 0.2, 0.15)
-        val indices = listOf(0, 1, 2, 3)
-        val valid = iods.filterValid(indices) { arrivals[it] }
-        assertEquals(listOf(0, 1, 2, 3), valid)
-    }
-
-    test("after recordScheduled, only arrivals >= threshold pass") {
-        val iods = IodsFilter()
-        val arrivals = listOf(0.1, 0.05, 0.2, 0.15)
-        val indices = listOf(0, 1, 2, 3)
-        iods.recordScheduled(0.15)
-        // Only 0.2 (idx=2) and 0.15 (idx=3) pass
-        val valid = iods.filterValid(indices) { arrivals[it] }
-        assertEquals(listOf(2, 3), valid, "Only arrivals >= 0.15 should pass")
-    }
-
-    test("null arrival filtered out") {
-        val iods = IodsFilter()
-        val valid = iods.filterValid(listOf(0, 1, 2)) { idx ->
-            if (idx == 1) null else 1.0
+            val config = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = true)
+            val result = selectConnectionIdx(connections, 0, nowMs(), config)
+            assertEquals(1, result, "Enhanced mode must switch to a clearly better link with no time-based delay")
         }
-        assertEquals(listOf(0, 2), valid)
-    }
 
-    test("empty candidates → empty result") {
-        val iods = IodsFilter()
-        val valid = iods.filterValid(emptyList()) { 1.0 }
-        assertEquals(emptyList<Int>(), valid)
-    }
+        test("test_enhanced_hysteresis_holds_when_gain_is_marginal") {
+            // Switching is damped in score space, not time: a link that is better by
+            // less than SWITCH_THRESHOLD (10%) does not win the packet.
+            val connections = createTestConnections(3)
+            connections[0].inFlightPackets = 20 // currently selected
+            connections[1].inFlightPackets = 19 // marginally better
+            connections[2].inFlightPackets = 40 // clearly worse
 
-    test("reset clears lastArrival") {
-        val iods = IodsFilter()
-        iods.recordScheduled(100.0)
-        // Nothing passes
-        val blocked = iods.filterValid(listOf(0)) { 1.0 }
-        assertTrue(blocked.isEmpty())
-        // After reset, should pass again
-        iods.reset()
-        val valid = iods.filterValid(listOf(0)) { 1.0 }
-        assertEquals(listOf(0), valid)
-    }
-
-    test("recordScheduled only increases lastArrival") {
-        val iods = IodsFilter()
-        iods.recordScheduled(0.5)
-        iods.recordScheduled(0.3) // lower → no change
-        val valid = iods.filterValid(listOf(0, 1)) { idx ->
-            if (idx == 0) 0.4 else 0.6
+            val config = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = true)
+            val result = selectConnectionIdx(connections, 0, nowMs(), config)
+            assertEquals(0, result, "Enhanced mode should hold the current link when the alternative is <10% better")
         }
-        // 0.4 < 0.5 → filtered; 0.6 >= 0.5 → passes
-        assertEquals(listOf(1), valid)
+
+        test("test_select_connection_idx_empty") {
+            val conns = emptyList<dev.abdulkadirozyurt.srtla.connection.SrtlaConnection>()
+            val result = selectConnectionIdx(conns, null, 0, ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = false))
+            assertNull(result)
+        }
+    }
+
+    suite("Selection (enhanced.rs)") {
+        test("handover_needs_both_a_clear_margin_and_a_served_minimum") {
+            // librist's field numbers: 126 vs 85 is noise between two failing
+            // legs; 1162 vs 406 is a genuinely better path.
+            assertFalse(soleCarrierHandover(126.0, 85.0, 10_000, 2000, 2.0))
+            assertTrue(soleCarrierHandover(1162.0, 406.0, 10_000, 2000, 2.0))
+            // ...but not before the incumbent has served its minimum.
+            assertFalse(soleCarrierHandover(1162.0, 406.0, 1999, 2000, 2.0))
+            // Exactly at the margin and exactly at the minimum both count.
+            assertTrue(soleCarrierHandover(800.0, 400.0, 2000, 2000, 2.0))
+        }
+
+        test("handover_refuses_to_act_on_an_unmeasured_link") {
+            // No RTT on either side is not evidence of a better path.
+            assertFalse(soleCarrierHandover(0.0, 400.0, 10_000, 2000, 2.0))
+            assertFalse(soleCarrierHandover(1200.0, 0.0, 10_000, 2000, 2.0))
+            assertFalse(soleCarrierHandover(Double.NaN, 400.0, 10_000, 2000, 2.0))
+        }
+
+        test("no_election_while_a_healthy_link_exists") {
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            val now = 100_000L
+            val result = electSoleCarrier(conns, now, true)
+            assertNull(result)
+            assertFalse(conns[0].isSoleCarrier())
+            assertFalse(conns[1].isSoleCarrier())
+            assertFalse(conns[0].isSoleCarrierExcluded())
+        }
+
+        test("every_link_failing_elects_one_and_holds_it") {
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            privFailingLink(conns[1], 1000.0)
+            val now = 100_000L
+
+            // Lowest smoothed RTT wins the first election. Taking the role when
+            // nobody held it is not a handover, so the churn counter stays at 0.
+            val result = electSoleCarrier(conns, now, false)
+            assertEquals(0, result)
+            assertTrue(conns[0].isSoleCarrier())
+            assertTrue(conns[1].isSoleCarrierExcluded())
+            assertEquals(0L, conns[0].soleCarrierElections())
+
+            // Link 1 pulls marginally ahead. Re-running the election every packet
+            // on the instantaneous measurement is exactly what made librist's
+            // payload path swap legs once a second, so the role must not move.
+            privFailingLink(conns[0], 1100.0)
+            privFailingLink(conns[1], 900.0)
+            for (tick in 0..9) {
+                val r = electSoleCarrier(conns, now + tick * 1000, false)
+                assertEquals(0, r, "a marginally better sibling must not take the role")
+            }
+            assertEquals(0L, conns[0].soleCarrierElections(), "no churn")
+        }
+
+        test("a_clearly_better_link_takes_the_role_once_the_hold_expires") {
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 1200.0)
+            privFailingLink(conns[1], 1300.0)
+            val now = 100_000L
+            val result = electSoleCarrier(conns, now, false)
+            assertEquals(0, result)
+
+            // Link 1 is now several times better — but the incumbent has only
+            // just taken the role.
+            privFailingLink(conns[1], 300.0)
+            val r1 = electSoleCarrier(conns, now + SOLE_CARRIER_MIN_HOLD_MS - 1, false)
+            assertEquals(0, r1)
+
+            // Past the minimum hold, the handover goes through.
+            val t = now + SOLE_CARRIER_MIN_HOLD_MS
+            val r2 = electSoleCarrier(conns, t, false)
+            assertEquals(1, r2)
+            assertTrue(conns[1].isSoleCarrier())
+            assertFalse(conns[0].isSoleCarrier())
+            assertEquals(1L, conns[1].soleCarrierElections())
+
+            // The link that just came back in ramps its share up rather than
+            // resuming at the score its idle time inflated.
+            assertTrue(conns[1].rejoinRampMultiplier(t) < 1.0)
+        }
+
+        test("the_role_moves_off_a_link_that_stops_being_a_candidate") {
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            privFailingLink(conns[1], 5000.0)
+            val now = 100_000L
+            val result = electSoleCarrier(conns, now, false)
+            assertEquals(0, result)
+
+            // The incumbent stalls out. Stickiness must not outrank a link
+            // being unusable, even though the sibling measures far worse.
+            conns[0].stallGated = true
+            val r2 = electSoleCarrier(conns, now + 100, false)
+            assertEquals(1, r2)
+        }
+
+        test("ending_the_election_ramps_the_excluded_link_back_in") {
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            privFailingLink(conns[1], 1000.0)
+            val now = 100_000L
+            electSoleCarrier(conns, now, false)
+            assertTrue(conns[1].isSoleCarrierExcluded())
+
+            // A link recovers, so the election ends and everyone competes again.
+            val t = now + 5000
+            val result = electSoleCarrier(conns, t, true)
+            assertNull(result)
+            assertFalse(conns[1].isSoleCarrierExcluded())
+            assertTrue(
+                conns[1].rejoinRampMultiplier(t) < 1.0,
+                "a link released from exclusion drained while out, so it must ramp rather than seize the stream on its inflated score"
+            )
+        }
+
+        test("a_flapping_sibling_does_not_churn_the_role_or_restart_the_hold") {
+            // A third link's `weak` flag flipping at classifier cadence tears the
+            // election down and rebuilds it. The same link keeps the role each
+            // time, so nothing has actually happened: the churn counter must stay
+            // flat and — the part that bites — the minimum hold must not restart.
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            privFailingLink(conns[1], 1000.0)
+            var now = 100_000L
+
+            val r1 = electSoleCarrier(conns, now, false)
+            assertEquals(0, r1)
+
+            for (i in 0..4) {
+                now += 500
+                // A link recovers: election off.
+                val r = electSoleCarrier(conns, now, true)
+                assertNull(r)
+                now += 500
+                // ...and fails again: election back on, same winner.
+                val r2 = electSoleCarrier(conns, now, false)
+                assertEquals(0, r2)
+            }
+            assertEquals(0L, conns[0].soleCarrierElections(), "re-forming around the same link is not a handover")
+
+            // 5s of flapping later, a clearly better challenger must be able to
+            // take the role — which it can only do if the hold kept accumulating.
+            privFailingLink(conns[1], 100.0)
+            val r3 = electSoleCarrier(conns, now, false)
+            assertEquals(1, r3)
+            assertEquals(1L, conns[1].soleCarrierElections(), "a real handover")
+        }
+
+        test("an_in_progress_ramp_is_never_restarted") {
+            // Same flapping, seen from the excluded sibling: each teardown ends its
+            // exclusion and would re-arm a ramp. Restarting it every cycle would
+            // pin the link at the ramp floor for as long as the flapping lasts.
+            val conns = createTestConnections(2)
+            privFailingLink(conns[0], 900.0)
+            privFailingLink(conns[1], 1000.0)
+            val start = 100_000L
+
+            val result = electSoleCarrier(conns, start, false)
+            assertEquals(0, result)
+            assertTrue(conns[1].isSoleCarrierExcluded())
+            electSoleCarrier(conns, start + 100, true) // released, ramp armed
+            val afterFirst = conns[1].rejoinRampMultiplier(start + 100)
+            assertTrue(afterFirst < 1.0, "release must arm a ramp")
+
+            // Flap several more times well inside the ramp window.
+            var now = start + 100
+            for (i in 0..3) {
+                now += 200
+                electSoleCarrier(conns, now, false)
+                now += 200
+                electSoleCarrier(conns, now, true)
+            }
+
+            // The ramp has been climbing the whole time, not resetting to the floor.
+            assertTrue(
+                conns[1].rejoinRampMultiplier(now) > afterFirst,
+                "a re-arm inside an active ramp must not restart it"
+            )
+        }
+
+        test("lifting_a_quality_exclusion_ramps_the_link_back_in") {
+            // The exclusion drains the link exactly like the stall gate does, so
+            // its falling edge needs the same ramp.
+            val conns = createTestConnections(2)
+            val now = nowMs()
+            conns[0].weak = true
+            conns[0].weakReason = WeakReason.HIGH_RTT
+            conns[1].inFlightPackets = 40
+
+            selectEnhanced(conns, null, now, true)
+            assertTrue(conns[0].isQualityExcluded())
+
+            // The delay verdict clears.
+            conns[0].weak = false
+            conns[0].weakReason = WeakReason.HEALTHY
+            val later = now + 10
+            selectEnhanced(conns, null, later, true)
+
+            assertFalse(conns[0].isQualityExcluded())
+            assertTrue(
+                conns[0].rejoinRampMultiplier(later) < 1.0,
+                "a link released from a quality exclusion must ramp back in"
+            )
+        }
+
+        test("a_late_link_is_held_out_of_the_rotation_entirely") {
+            val conns = createTestConnections(2)
+            val now = nowMs()
+            conns[0].weak = true
+            conns[0].weakReason = WeakReason.HIGH_RTT
+            // Link 0 would win on raw score: the healthy link is the busy one.
+            conns[1].inFlightPackets = 40
+
+            val result = selectEnhanced(conns, null, now, true)
+            assertEquals(1, result)
+            assertTrue(
+                conns[0].isQualityExcluded(),
+                "a late link must be held out, not trickled: every unique sequence number on it is a hole the receiver waits for"
+            )
+        }
+
+        test("an_under_used_link_keeps_its_trickle_of_real_traffic") {
+            val conns = createTestConnections(2)
+            val now = nowMs()
+            conns[0].weak = true
+            conns[0].weakReason = WeakReason.LOW_SHARE
+            conns[1].inFlightPackets = 40
+
+            val result = selectEnhanced(conns, null, now, true)
+            assertEquals(1, result)
+            assertFalse(
+                conns[0].isQualityExcluded(),
+                "share weakness is not lateness — the link needs real traffic to earn back the share that clears the verdict"
+            )
+        }
+
+        test("a_loss_degraded_link_is_held_out_whatever_the_weak_reason") {
+            val conns = createTestConnections(2)
+            val now = nowMs()
+            conns[0].lossDegraded = true
+            conns[1].inFlightPackets = 40
+
+            val result = selectEnhanced(conns, null, now, true)
+            assertEquals(1, result)
+            assertTrue(conns[0].isQualityExcluded())
+        }
+
+        test("nothing_is_held_out_when_no_healthy_link_can_carry") {
+            // Both links late: the exclusion must not fire on every link at once.
+            // One is elected to carry and the other is held out, but a link is
+            // always returned.
+            val conns = createTestConnections(2)
+            val now = nowMs()
+            for (c in conns) {
+                c.weak = true
+                c.weakReason = WeakReason.HIGH_RTT
+            }
+            val picked = selectEnhanced(conns, null, now, true)
+            assertNotNull(picked, "selection must never drop the packet")
+            assertFalse(conns[picked!!].isQualityExcluded())
+            assertTrue(conns[picked].isSoleCarrier())
+        }
+
+        test("cap_no_signal_returns_unity") {
+            val c = createTestConnection()
+            // cc_target_bps default 0 → no cap.
+            assertClose(1.0, ccSoftCapMultiplier(c), 1e-9)
+        }
+
+        test("cap_idle_link_returns_unity") {
+            val c = createTestConnection()
+            c.ccTargetBps = 1_000_000L
+            c.bitrate.currentBitrateBps = 0.0
+            // Plenty of headroom on an idle link.
+            assertClose(1.0, ccSoftCapMultiplier(c), 1e-9)
+        }
+
+        test("cap_at_target_falls_to_floor") {
+            val c = createTestConnection()
+            c.ccTargetBps = 1_000_000L
+            c.bitrate.currentBitrateBps = 1_000_000.0
+            // Saturated → floor multiplier (10%).
+            val m = ccSoftCapMultiplier(c)
+            assertClose(CC_SOFT_CAP_FLOOR, m, 1e-9, "got $m")
+        }
+
+        test("in_flight_cap_no_signal") {
+            // cc_target_bps == 0 → cap inactive regardless of in_flight.
+            assertNull(inFlightCapPackets(0, 50.0))
+            val c = createTestConnection()
+            c.ccTargetBps = 0
+            c.inFlightPackets = 10_000
+            assertFalse(inFlightCapExceeded(c))
+        }
+
+        test("in_flight_cap_floors_at_one") {
+            // 100 kbps over a 20 ms RTT: BDP = 1e5 * 0.02 / 8 = 250 bytes,
+            // x1.5 = 375 bytes < one packet, so the cap floors at 1.
+            val cap = inFlightCapPackets(100_000L, 20.0)
+            assertNotNull(cap)
+            assertEquals(1, cap)
+        }
+
+        test("in_flight_cap_scales_with_bdp") {
+            // 10 Mbps over 50 ms: BDP = 1e7 * 0.05 / 8 = 62_500 bytes, x1.5
+            // = 93_750, / 1316 ≈ 71 packets.
+            val cap = inFlightCapPackets(10_000_000L, 50.0)
+            assertNotNull(cap)
+            assertTrue((68..74).contains(cap!!), "got $cap")
+            // Same rate at 4x the RTT gives ~4x the cap (path-relative).
+            val capHighRtt = inFlightCapPackets(10_000_000L, 200.0)
+            assertNotNull(capHighRtt)
+            assertTrue(capHighRtt!! > cap!! * 3, "got $capHighRtt vs $cap")
+        }
+
+        test("in_flight_cap_engaged_when_exceeded") {
+            val c = createTestConnection()
+            c.ccTargetBps = 10_000_000L
+            val cap = inFlightCapPackets(c.ccTargetBps, c.getRttMinMs())
+            assertNotNull(cap)
+            c.inFlightPackets = cap!!
+            assertFalse(inFlightCapExceeded(c), "at cap is allowed, only above triggers")
+            c.inFlightPackets = cap!! + 1
+            assertTrue(inFlightCapExceeded(c))
+        }
+
+        test("cap_half_target_returns_half") {
+            val c = createTestConnection()
+            c.ccTargetBps = 1_000_000L
+            c.bitrate.currentBitrateBps = 500_000.0
+            val m = ccSoftCapMultiplier(c)
+            assertClose(0.5, m, 0.01, "got $m")
+        }
+    }
+
+    suite("Selection (classifier.rs)") {
+        test("target_tier_math") {
+            assertEquals(400, targetBestDelayMs(1000))
+            assertEquals(500, targetSafeDelayMs(1000))
+            assertEquals(600, targetMaxDelayMs(1000))
+
+            // Caps
+            assertEquals(TARGET_BEST_SAFE_CAP_MS, targetBestDelayMs(10_000))
+            assertEquals(TARGET_BEST_SAFE_CAP_MS, targetSafeDelayMs(10_000))
+            assertEquals(TARGET_MAX_CAP_MS, targetMaxDelayMs(10_000))
+        }
+
+        test("budget_floor_and_ceiling") {
+            assertEquals(MIN_BUDGET_MS, deriveMaxDelayBudget(50))
+            assertEquals(MAX_BUDGET_MS, deriveMaxDelayBudget(2000))
+            assertEquals(1500, deriveMaxDelayBudget(500))
+        }
+
+        test("the_peers_declared_buffer_wins_over_the_rtt_estimate") {
+            // A 4s receive buffer is an 8s round-trip budget, whatever our own RTT
+            // happens to be. Left to the estimate, a 200ms link would have produced
+            // a 600ms budget and judged everything against that.
+            assertEquals(8000, delayBudgetMs(4000, 200))
+            assertEquals(600, deriveMaxDelayBudget(200))
+
+            // Nothing declared: the estimate still stands.
+            assertEquals(deriveMaxDelayBudget(500), delayBudgetMs(0, 500))
+
+            // The estimate's own ceiling must not apply here.
+            assertTrue(delayBudgetMs(4000, 200) > MAX_BUDGET_MS)
+        }
+
+        test("a_declared_buffer_is_bounded_at_both_ends") {
+            // These 16 bits come off the network.
+            assertEquals(MIN_BUDGET_MS, delayBudgetMs(10, 200))
+            assertEquals(MAX_NEGOTIATED_BUDGET_MS, delayBudgetMs(65535, 200))
+        }
+
+        test("a_link_is_late_against_the_real_buffer_not_the_guess") {
+            // Two links at 900ms and 50ms. The estimate derives its budget from the
+            // *longest* RTT — 3 x 900 = 2700, max tier 1620 — so the slow link
+            // clears a bar it set itself.
+            val conns = createTestConnections(2)
+            conns[0].bitrate.currentBitrateBps = 1_000_000.0
+            privSetRtt(conns[0], 50.0)
+            conns[1].bitrate.currentBitrateBps = 1_000_000.0
+            privSetRtt(conns[1], 900.0)
+            val slow = conns[1].connId
+
+            // Guessing: the slow link sets its own bar and passes.
+            var filter = WeakLinkFilter()
+            for (i in 0..WEAK_SUSTAIN_TICKS) {
+                filter.classify(conns, 0)
+            }
+            var (weak, _) = privVerdict(filter.classify(conns, 0), slow)
+            assertFalse(weak, "the RTT estimate cannot see that 900ms is too slow")
+
+            // A 500ms receive buffer: budget 1000, max tier 600. 900ms of round
+            // trip is 450ms one way, most of the buffer gone before a
+            // retransmission is even possible.
+            filter = WeakLinkFilter()
+            for (i in 0..WEAK_SUSTAIN_TICKS) {
+                filter.classify(conns, 500)
+            }
+            var result = filter.classify(conns, 500)
+            var verdict = privVerdict(result, slow)
+            assertTrue(verdict.first, "a link that busts the real buffer must be weak")
+            assertEquals(WeakReason.HIGH_RTT, verdict.second)
+
+            // A 4s buffer over the same links: 900ms is comfortably inside it.
+            filter = WeakLinkFilter()
+            for (i in 0..WEAK_SUSTAIN_TICKS) {
+                filter.classify(conns, 4000)
+            }
+            verdict = privVerdict(filter.classify(conns, 4000), slow)
+            assertFalse(verdict.first, "a generous buffer must not condemn the same link")
+        }
+
+        test("pick_tier_picks_best_when_85pct_fits") {
+            val tier = pickTier(1000.0, 900.0, 950.0, 1000.0, 100, 200, 300)
+            assertEquals(100, tier)
+        }
+
+        test("pick_tier_falls_back_to_safe") {
+            val tier = pickTier(1000.0, 100.0, 900.0, 1000.0, 100, 200, 300)
+            assertEquals(200, tier)
+        }
+
+        test("pick_tier_falls_back_to_max") {
+            val tier = pickTier(1000.0, 0.0, 0.0, 100.0, 100, 200, 300)
+            assertEquals(300, tier)
+        }
+
+        test("empty_classification_returns_bypassed") {
+            val filter = WeakLinkFilter()
+            val result = filter.classify(emptyList(), 0)
+            assertEquals(0, result.selectedDelayMs)
+            assertTrue(result.perLink.isEmpty())
+        }
+
+        test("probation_re_tests_a_share_starved_link") {
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            val filter = WeakLinkFilter()
+
+            // Share-weak every tick, and stays gated right up to the trigger tick.
+            for (tick in 0 until PROBATION_INTERVAL_TICKS) {
+                val r = filter.classify(conns, 0)
+                val (weak, reason) = privVerdict(r, id)
+                assertTrue(weak, "tick $tick: starved link should be weak")
+                assertEquals(WeakReason.LOW_SHARE, reason)
+            }
+
+            // Window opens: real traffic is the only way to re-prove share.
+            val (weak, reason) = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(weak, "probation must re-test the starved link")
+            assertEquals(WeakReason.HEALTHY, reason)
+        }
+
+        test("a_delay_verdict_cancels_the_probation_window") {
+            // The hole this closes: probation used to override whatever the tick
+            // computed, so a link that went late *during* its re-test kept a full
+            // share of unique payload until the window ran out.
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            val filter = WeakLinkFilter()
+
+            for (i in 0 until PROBATION_INTERVAL_TICKS) {
+                filter.classify(conns, 0)
+            }
+            // First window tick: still fast, so the re-test proceeds.
+            val (weak, _) = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(weak, "precondition: the window opened")
+
+            // Loaded at last, the link turns out to be badly late. A delay verdict
+            // needs WEAK_SUSTAIN_TICKS consecutive samples to latch.
+            privSetRtt(conns[1], 3000.0)
+            var verdict = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(verdict.first, "one late sample is still just a blip")
+
+            verdict = privVerdict(filter.classify(conns, 0), id)
+            assertTrue(verdict.first, "a sustained delay verdict must end the re-test")
+            assertEquals(WeakReason.HIGH_RTT, verdict.second)
+
+            // ...and it is cancelled, not merely suspended: the remaining window
+            // ticks must not resume handing the link unique payload.
+            for (tick in 0 until PROBATION_WINDOW_TICKS) {
+                val (w, r) = privVerdict(filter.classify(conns, 0), id)
+                assertTrue(w, "tick $tick after cancellation must stay gated")
+                assertEquals(WeakReason.HIGH_RTT, r)
+            }
+        }
+
+        test("probation_backoff_doubles_and_saturates") {
+            // First window is free; each failure thereafter doubles the wait.
+            assertEquals(2, probationBackoffNext(0))
+            assertEquals(2, probationBackoffNext(1))
+            assertEquals(4, probationBackoffNext(2))
+            assertEquals(16, probationBackoffNext(8))
+            // ...up to the ceiling, and no further.
+            assertEquals(PROBATION_BACKOFF_MAX, probationBackoffNext(PROBATION_BACKOFF_MAX))
+        }
+
+        test("a_second_re_test_waits_twice_as_long_as_the_first") {
+            // The hole this closes: the interval was fixed, so a link that could
+            // never carry its share drew a full window of unique payload every
+            // PROBATION_INTERVAL_TICKS forever.
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            val filter = WeakLinkFilter()
+
+            // First re-test, at the base interval.
+            for (i in 0 until PROBATION_INTERVAL_TICKS) {
+                filter.classify(conns, 0)
+            }
+            var (weak, _) = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(weak, "precondition: the first window opened")
+            // Run the window out. The link is still starved, so it fails.
+            for (i in 1 until PROBATION_WINDOW_TICKS) {
+                filter.classify(conns, 0)
+            }
+
+            // Where the old code re-tested again, the link must stay gated.
+            for (tick in 0 until PROBATION_INTERVAL_TICKS) {
+                val (w, _) = privVerdict(filter.classify(conns, 0), id)
+                assertTrue(w, "tick $tick: a failed re-test must not retry on time")
+            }
+            // It gets its second chance only after the doubled interval.
+            for (tick in 0 until PROBATION_INTERVAL_TICKS) {
+                val (w, _) = privVerdict(filter.classify(conns, 0), id)
+                assertTrue(w, "tick $tick: still inside the doubled interval")
+            }
+            val (w, _) = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(w, "the doubled interval must still re-test eventually")
+        }
+
+        test("a_re_test_that_holds_resets_the_backoff") {
+            // A link recovering from a transient dip must not inherit the
+            // escalation earned by whatever starved it earlier.
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            val filter = WeakLinkFilter()
+
+            // Earn and fail one window, escalating to 2x.
+            for (i in 0..PROBATION_INTERVAL_TICKS) {
+                filter.classify(conns, 0)
+            }
+            for (i in 1 until PROBATION_WINDOW_TICKS) {
+                filter.classify(conns, 0)
+            }
+            assertEquals(2, filter.probationBackoff[id], "precondition: the failed window escalated")
+
+            // The link recovers and carries a real share outside any window.
+            conns[1].bitrate.currentBitrateBps = 900_000.0
+            var (weak, _) = privVerdict(filter.classify(conns, 0), id)
+            assertFalse(weak, "a link at full share is not weak")
+            assertEquals(1, filter.probationBackoff[id], "a re-test that held must clear the escalation")
+        }
+
+        test("a_cancelled_re_test_keeps_its_escalation") {
+            // Cancellation is the *worst* outcome — the link proved it goes late
+            // under load — so it must not be cheaper than simply staying starved.
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            val filter = WeakLinkFilter()
+
+            for (i in 0..PROBATION_INTERVAL_TICKS) {
+                filter.classify(conns, 0)
+            }
+            // Loaded at last, the link turns out to be late; the window cancels.
+            privSetRtt(conns[1], 3000.0)
+            for (i in 0..WEAK_SUSTAIN_TICKS) {
+                filter.classify(conns, 0)
+            }
+            var (weak, reason) = privVerdict(filter.classify(conns, 0), id)
+            assertTrue(weak, "precondition: the re-test was cancelled")
+            assertEquals(WeakReason.HIGH_RTT, reason)
+            assertEquals(2, filter.probationBackoff[id], "a link gated for lateness must keep the escalation it earned")
+        }
+
+        test("a_link_that_is_late_never_earns_a_probation_window") {
+            // Delay weakness must not arm probation in the first place: it clears
+            // from live RTT, which keepalive echoes and probe ACKs keep supplying
+            // even while the link is held out of the rotation.
+            val conns = privStarvedPair()
+            val id = conns[1].connId
+            privSetRtt(conns[1], 3000.0)
+            val filter = WeakLinkFilter()
+
+            for (tick in 0 until (PROBATION_INTERVAL_TICKS * 2)) {
+                var (weak, reason) = privVerdict(filter.classify(conns, 0), id)
+                assertTrue(weak, "tick $tick: a late link stays weak")
+                if (tick >= WEAK_SUSTAIN_TICKS) {
+                    assertEquals(WeakReason.HIGH_RTT, reason, "tick $tick: and stays late, never re-tested")
+                }
+            }
+        }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EDPF tests (mirrors src/sender/selection/edpf.rs #[cfg(test)])
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── Private test helpers ────────────────────────────────────────────────────
 
-suite("EdpfSelection") {
+/** Mark a link quality-gated with a given smoothed RTT. */
+private fun privFailingLink(c: dev.abdulkadirozyurt.srtla.connection.SrtlaConnection, rttMs: Double) {
+    c.weak = true
+    privSetRtt(c, rttMs)
+}
 
-    test("prefers lower predicted arrival time") {
-        // c1 has best: low in-flight, high bitrate, low RTT
-        val c0 = makeSelConn(inFlight = 10, bitrateBps = 1_000_000.0, smoothRtt = 50.0)
-        val c1 = makeSelConn(inFlight = 0,  bitrateBps = 2_000_000.0, smoothRtt = 20.0)
-        val c2 = makeSelConn(inFlight = 20, bitrateBps = 500_000.0, smoothRtt = 100.0)
-        val sel = edpfSelectFrom(listOf(c0, c1, c2), SRT_PKT_SIZE)
-        assertEquals(1, sel, "Should pick conn with lowest predicted arrival")
-    }
-
-    test("skips disconnected connections") {
-        val c0 = makeSelConn(connected = false, bitrateBps = 10_000_000.0)
-        val c1 = makeSelConn(inFlight = 5, bitrateBps = 1_000_000.0, smoothRtt = 50.0)
-        val sel = edpfSelectFrom(listOf(c0, c1), SRT_PKT_SIZE)
-        assertEquals(1, sel)
-    }
-
-    test("empty connections → null") {
-        val sel = edpfSelectFrom(emptyList(), SRT_PKT_SIZE)
-        assertNull(sel)
-    }
-
-    test("selectFromIndices picks best within subset") {
-        // c0 is overall best but excluded from indices
-        val c0 = makeSelConn(inFlight = 0, bitrateBps = 5_000_000.0, smoothRtt = 10.0)
-        val c1 = makeSelConn(inFlight = 0, bitrateBps = 1_000_000.0, smoothRtt = 50.0)
-        val c2 = makeSelConn(inFlight = 0, bitrateBps = 2_000_000.0, smoothRtt = 20.0)
-        // Only consider indices 1 and 2
-        val sel = edpfSelectFromIndices(listOf(c0, c1, c2), listOf(1, 2), SRT_PKT_SIZE)
-        assertEquals(2, sel, "Should pick best from subset (excluding c0)")
-    }
-
-    test("no bitrate data → null arrival → fallback skips that link") {
-        // c0 has no bitrate, c1 has bitrate
-        val c0 = makeSelConn(inFlight = 0) // bitrateBps=0 → null arrival
-        val c1 = makeSelConn(inFlight = 0, bitrateBps = 1_000_000.0, smoothRtt = 50.0)
-        val sel = edpfSelectFrom(listOf(c0, c1), SRT_PKT_SIZE)
-        assertEquals(1, sel, "Should skip link with no bitrate")
+/** Set a connection's RTT to a stable value. */
+private fun privSetRtt(c: dev.abdulkadirozyurt.srtla.connection.SrtlaConnection, rttMs: Double) {
+    c.rtt.kalmanRtt.update(rttMs)
+    // Kalman needs a couple of samples to sit on the value.
+    for (i in 0..11) {
+        c.rtt.kalmanRtt.update(rttMs)
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SelectionOrchestrator / ConfigSnapshot tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("SelectionOrchestrator") {
-
-    test("EDPF mode: selects without crashing (no bitrate → fallback to classic behavior)") {
-        val conns = listOf(makeSelConn(inFlight = 0), makeSelConn(inFlight = 5))
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.EDPF)
-        // Without bitrate data edpf returns null → orchestrator may return null
-        // Just verify no exception
-        orch.select(conns, null, 0L, System.currentTimeMillis(), cfg)
-    }
-
-    test("EDPF pipeline with bitrate data: picks lowest arrival") {
-        val c0 = makeSelConn(inFlight = 0, bitrateBps = 2_000_000.0, smoothRtt = 20.0)
-        val c1 = makeSelConn(inFlight = 10, bitrateBps = 500_000.0, smoothRtt = 100.0)
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.EDPF)
-        val sel = orch.select(listOf(c0, c1), null, 0L, System.currentTimeMillis(), cfg)
-        assertEquals(0, sel, "EDPF should pick connection with lowest predicted arrival")
-    }
-
-    test("ConfigSnapshot effectiveQualityEnabled: false for Classic") {
-        val cfg = ConfigSnapshot(mode = SchedulingMode.CLASSIC, qualityEnabled = true)
-        assertFalse(cfg.effectiveQualityEnabled(), "Classic mode suppresses quality")
-    }
-
-    test("ConfigSnapshot effectiveQualityEnabled: true for Enhanced when enabled") {
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED, qualityEnabled = true)
-        assertTrue(cfg.effectiveQualityEnabled())
-    }
-
-    test("ConfigSnapshot effectiveQualityEnabled: true for RttThreshold when enabled") {
-        val cfg = ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD, qualityEnabled = true)
-        assertTrue(cfg.effectiveQualityEnabled())
-    }
-
-    test("ConfigSnapshot effectiveQualityEnabled: true for EDPF (not classic)") {
-        // Rust: quality_enabled && !mode.is_classic() → EDPF is not Classic → true
-        val cfg = ConfigSnapshot(mode = SchedulingMode.EDPF, qualityEnabled = true)
-        assertTrue(cfg.effectiveQualityEnabled(), "EDPF is not classic, so quality enabled")
-    }
-
-    test("ConfigSnapshot effectiveExplorationEnabled: only Enhanced") {
-        assertTrue(ConfigSnapshot(mode = SchedulingMode.ENHANCED,
-            explorationEnabled = true).effectiveExplorationEnabled())
-        assertFalse(ConfigSnapshot(mode = SchedulingMode.RTT_THRESHOLD,
-            explorationEnabled = true).effectiveExplorationEnabled())
-        assertFalse(ConfigSnapshot(mode = SchedulingMode.CLASSIC,
-            explorationEnabled = true).effectiveExplorationEnabled())
-    }
-
-    test("ConfigSnapshot default: Enhanced, quality=true, explore=false, delta=30") {
-        val cfg = ConfigSnapshot()
-        assertEquals(SchedulingMode.ENHANCED, cfg.mode)
-        assertTrue(cfg.qualityEnabled)
-        assertFalse(cfg.explorationEnabled)
-        assertEquals(RTT_DELTA_DEFAULT_MS, cfg.rttDeltaMs)
-    }
-
-    test("stale quality cache entries pruned when connection removed") {
-        val c0 = makeSelConn()
-        val orch = SelectionOrchestrator()
-        val cfg = ConfigSnapshot(mode = SchedulingMode.ENHANCED)
-        val now = System.currentTimeMillis()
-        // First call: c0 gets a cache entry
-        orch.select(listOf(c0), null, 0L, now, cfg)
-        // Second call without c0: its cache should be pruned (no crash)
-        orch.select(emptyList(), null, 0L, now, cfg)
-        // Third call adding c0 back: fresh cache
-        val sel = orch.select(listOf(c0), null, 0L, now, cfg)
-        assertNotNull(sel)
-    }
+/** One healthy link carrying the stream plus one starved link. */
+private fun privStarvedPair(): MutableList<dev.abdulkadirozyurt.srtla.connection.SrtlaConnection> {
+    val conns = createTestConnections(2)
+    conns[0].bitrate.currentBitrateBps = 1_000_000.0
+    privSetRtt(conns[0], 50.0)
+    conns[1].bitrate.currentBitrateBps = 10_000.0
+    privSetRtt(conns[1], 50.0)
+    return conns
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SchedulingMode enum tests (mirrors src/mode.rs #[cfg(test)])
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("SchedulingMode") {
-
-    test("default mode is ENHANCED") {
-        val cfg = ConfigSnapshot()
-        assertEquals(SchedulingMode.ENHANCED, cfg.mode)
-    }
-
-    test("isClassic / isEnhanced / isRttThreshold / isEdpf checks") {
-        assertTrue(SchedulingMode.CLASSIC.isClassic())
-        assertFalse(SchedulingMode.CLASSIC.isEnhanced())
-        assertFalse(SchedulingMode.CLASSIC.isRttThreshold())
-        assertFalse(SchedulingMode.CLASSIC.isEdpf())
-
-        assertTrue(SchedulingMode.ENHANCED.isEnhanced())
-        assertFalse(SchedulingMode.ENHANCED.isClassic())
-
-        assertTrue(SchedulingMode.RTT_THRESHOLD.isRttThreshold())
-        assertFalse(SchedulingMode.RTT_THRESHOLD.isClassic())
-
-        assertTrue(SchedulingMode.EDPF.isEdpf())
-        assertFalse(SchedulingMode.EDPF.isClassic())
-    }
+/** Extract a link's weak verdict from a classification result. */
+private fun privVerdict(result: ClassificationResult, connId: Long): Pair<Boolean, WeakReason> {
+    val e = result.perLink.find { it.connId == connId } ?: error("link classified")
+    return e.weak to e.reason
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Exploration logic tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-suite("ExplorationLogic") {
-
-    test("returns false without best and second-best") {
-        val now = System.currentTimeMillis()
-        assertFalse(shouldExploreNow(emptyList(), null, null, now))
-        assertFalse(shouldExploreNow(listOf(makeSelConn()), 0, null, now))
-    }
-
-    test("triggers when best is degraded and second has recovered") {
-        val now = System.currentTimeMillis()
-        // best: recent NAK (1s ago → < 3s)
-        val best = makeSelConn(nakCount = 1, lastNakAgoMs = 1_000L, connEstAgoMs = 35_000L)
-        // second: recovered (last NAK 6s ago → > 5s)
-        val second = makeSelConn(nakCount = 1, lastNakAgoMs = 6_000L, connEstAgoMs = 35_000L)
-        val conns = listOf(best, second)
-        // Compute at a time not on the periodic boundary (use a controlled time)
-        val nonPeriodicTime = (now / 30_000L) * 30_000L + 10_000L // 10s into a 30s cycle
-        val result = shouldExploreNow(conns, 0, 1, nonPeriodicTime)
-        assertTrue(result, "Should explore when best degraded and second recovered")
-    }
-
-    test("does not trigger when best is not degraded") {
-        val now = (System.currentTimeMillis() / 30_000L) * 30_000L + 10_000L
-        // best: last NAK 5s ago → not degraded (need < 3s)
-        val best = makeSelConn(nakCount = 1, lastNakAgoMs = 5_000L, connEstAgoMs = 35_000L)
-        val second = makeSelConn(nakCount = 0, connEstAgoMs = 35_000L)
-        val conns = listOf(best, second)
-        val result = shouldExploreNow(conns, 0, 1, now)
-        assertFalse(result, "Should not explore when best is not degraded")
-    }
-}
-
-} // registerSelectionTests
+private const val TARGET_BEST_SAFE_CAP_MS = 2500
+private const val TARGET_MAX_CAP_MS = 5000

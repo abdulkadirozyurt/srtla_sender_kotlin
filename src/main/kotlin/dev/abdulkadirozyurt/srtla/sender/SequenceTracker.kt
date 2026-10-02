@@ -1,67 +1,51 @@
-// Ported from irlserver/srtla_send v3.0.0 (MIT)
+// Ported from irlserver/srtla_send v4.1.0 (MIT)
 // Source: src/sender/sequence.rs
 //
-// Zero-allocation sequence tracking using a fixed-size ring buffer.
-// SEQ_TRACKING_SIZE = 16384 (power of 2, covers ~5s at 3000 pkt/s).
-// Replaces the Rust SEQ_TRACKING_SIZE approach; PKT_LOG_SIZE (256) is the
-// per-connection in-flight log size — different concern.
-//
-// JVM note: Rust uses a Box<[Entry; 16384]> on heap; we use a plain array.
+// Zero-allocation sequence → connection tracking in a fixed ring indexed by
+// `seq & MASK`. Collisions are detected by storing the sequence; stale entries
+// by timestamp. Old entries are simply overwritten, so no cleanup pass exists.
 package dev.abdulkadirozyurt.srtla.sender
 
-// src/sender/sequence.rs
-const val SEQ_TRACKING_SIZE: Int = 16384  // power of 2
+import dev.abdulkadirozyurt.srtla.core.satSub
+
+/** Ring size (power of 2): ~5 s at 3000 packets/s. */
+const val SEQ_TRACKING_SIZE: Int = 16384
 private const val SEQ_TRACKING_MASK: Int = SEQ_TRACKING_SIZE - 1
-const val SEQUENCE_TRACKING_MAX_AGE_MS: Long = 5_000L
 
-/**
- * Single entry in the sequence tracking ring buffer.
- * connId = 0 means empty/invalid.
- */
-private data class SequenceEntry(
-    val connId: Long,
-    val timestampMs: Long,
-    val seq: Long,
-)
+/** Maximum age of a valid entry. */
+const val SEQUENCE_TRACKING_MAX_AGE_MS: Long = 5000L
 
-private val EMPTY_ENTRY = SequenceEntry(0L, 0L, 0L)
-
-/**
- * Zero-allocation sequence tracker using a fixed-size ring buffer.
- * Mirrors Rust `struct SequenceTracker` in src/sender/sequence.rs.
- *
- * Index = seq & SEQ_TRACKING_MASK (O(1) insert and lookup).
- * Collisions handled by storing actual seq and checking on lookup.
- * Stale entries detected by timestamp.
- */
 class SequenceTracker {
-    private val entries: Array<SequenceEntry> = Array(SEQ_TRACKING_SIZE) { EMPTY_ENTRY }
+    /** connId per slot; 0 = empty. */
+    private val connIds = LongArray(SEQ_TRACKING_SIZE)
+    private val timestamps = LongArray(SEQ_TRACKING_SIZE)
+    private val seqs = IntArray(SEQ_TRACKING_SIZE)
 
-    /** Insert a sequence number → connection-ID mapping. O(1). */
-    fun insert(seq: Long, connId: Long, timestampMs: Long) {
-        val idx = (seq.toInt()) and SEQ_TRACKING_MASK
-        entries[idx] = SequenceEntry(connId, timestampMs, seq)
+    /** O(1) insert; never allocates. */
+    fun insert(seq: Int, connId: Long, timestampMs: Long) {
+        val idx = seq and SEQ_TRACKING_MASK
+        connIds[idx] = connId
+        timestamps[idx] = timestampMs
+        seqs[idx] = seq
     }
 
-    /**
-     * Look up a sequence number. Returns connId or null if empty/expired/collision.
-     * O(1).
-     */
-    fun get(seq: Long, currentTimeMs: Long): Long? {
-        val idx = (seq.toInt()) and SEQ_TRACKING_MASK
-        val e = entries[idx]
-        if (e.connId == 0L) return null
-        if (e.seq != seq) return null
-        if ((currentTimeMs - e.timestampMs) > SEQUENCE_TRACKING_MAX_AGE_MS) return null
-        return e.connId
+    /** connId that sent [seq], or null when empty, collided or expired. */
+    fun get(seq: Int, currentTimeMs: Long): Long? {
+        val idx = seq and SEQ_TRACKING_MASK
+        val id = connIds[idx]
+        if (id == 0L || seqs[idx] != seq) return null
+        if (currentTimeMs.satSub(timestamps[idx]) > SEQUENCE_TRACKING_MAX_AGE_MS) return null
+        return id
     }
 
-    /**
-     * Remove all entries for a specific connection (O(n); only called on connection removal).
-     */
+    /** Drop every entry owned by [connId]. O(n); only on removal/recovery. */
     fun removeConnection(connId: Long) {
-        for (i in entries.indices) {
-            if (entries[i].connId == connId) entries[i] = EMPTY_ENTRY
+        for (i in 0 until SEQ_TRACKING_SIZE) {
+            if (connIds[i] == connId) {
+                connIds[i] = 0L
+                timestamps[i] = 0L
+                seqs[i] = 0
+            }
         }
     }
 }

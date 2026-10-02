@@ -1,21 +1,16 @@
 // Copyright (c) 2025-2026 Abdulkadir Özyurt — Kotlin port of irlserver/srtla_send (MIT)
-// MockSrtlaReceiver: E2E test helper simulating a SRTLA receiver over loopback UDP.
-// Protocol behaviour mirrors irlserver/srtla_recv REG1→REG2→REG3 handshake.
-// E2E test helper — MockSrtlaReceiver
+// MockSrtlaReceiver: E2E test helper simulating an SRTLA receiver over loopback UDP.
 //
-// Simulates a minimal SRTLA receiver for end-to-end testing over real loopback UDP.
+// Protocol behaviour (mirrors srtla_rec):
+//   1. REG1 → keep the sender's first id half, mint the second half, reply REG2.
+//   2. REG2 carrying an id we minted → join the group, reply REG3.
+//      REG2 carrying an unknown id (the sender's RTT probe) → reply REG_NGP.
+//   3. KEEPALIVE → echoed verbatim (RTT measurement).
+//   4. SRT data → counted (distinct sequences and retransmit-flagged copies);
+//      optional per-packet SRTLA ACK back on the arrival address.
+//   5. SRT ACK / NAK injection toward one or every registered uplink.
 //
-// Protocol behaviour (mirrors irlserver srtla_recv):
-//   1. REG1 received → modify last 128 bytes of ID, reply REG2
-//   2. REG2 received from each uplink → reply REG3 (connection group accept)
-//   3. Keepalive received → echo back (RTT measurement support)
-//   4. SRT data packets counted in stats
-//   5. SRTLA ACK sent on demand via sendAck()
-//   6. NAK injection via injectNak()
-//
-// Thread-safety: all mutable state protected by synchronized(lock).
-// The receiver runs a single background thread reading from one UDP socket
-// (all uplinks send to the same receiver port, identified by sender address).
+// Thread-safety: one reader thread; shared state guarded by `lock`.
 package dev.abdulkadirozyurt.srtla.e2e
 
 import dev.abdulkadirozyurt.srtla.protocol.*
@@ -23,98 +18,41 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.SocketAddress
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 
-/**
- * Tracks one registered uplink connection group entry.
- * An "uplink" is identified by the sender's (address, port) tuple.
- */
-data class UplinkEntry(
-    val addr: SocketAddress,
-    val groupId: ByteArray,          // 256-byte registration ID (receiver's copy)
-    var reg3Sent: Boolean = false,
-    val nakCount: AtomicInteger = AtomicInteger(0),
-)
-
-/**
- * Mock SRTLA receiver — lightweight UDP server for E2E tests.
- *
- * Binds to 127.0.0.1:0 (ephemeral port). Use [port] after construction.
- * Call [start] to begin serving, [stop] to shut down.
- */
 class MockSrtlaReceiver {
-
-    // ── Socket ────────────────────────────────────────────────────────────────
     private val socket = DatagramSocket(InetSocketAddress("127.0.0.1", 0))
     val port: Int get() = socket.localPort
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
     private val running = AtomicBoolean(false)
     private var readerThread: Thread? = null
-
-    // ── State lock ────────────────────────────────────────────────────────────
     private val lock = Any()
 
-    // ── Connection group (senders that completed REG3) ────────────────────────
-    /** Registered uplinks — address → UplinkEntry */
-    private val registeredUplinks: MutableMap<SocketAddress, UplinkEntry> = LinkedHashMap()
+    /** Group ids this receiver minted (REG2 replies). */
+    private val mintedIds = ArrayList<ByteArray>()
+    /** Uplink source addresses that completed REG3. */
+    private val registered = LinkedHashSet<SocketAddress>()
+    /** Distinct SRT data sequences received. */
+    private val seenSeqs = HashSet<Int>()
 
-    // ── Pending registrations (REG1 received, REG2 sent, awaiting REG2-reply) ─
-    /** Uplinks that sent REG1; storing the modified ID we sent back as REG2. */
-    private val pendingReg2: MutableMap<SocketAddress, ByteArray> = HashMap()
-
-    // ── Statistics ────────────────────────────────────────────────────────────
-    /** Total SRT data packets received (all uplinks). */
     val srtDataPacketsReceived = AtomicInteger(0)
-    /** Total keepalives received. */
+    val retransmitFlaggedReceived = AtomicInteger(0)
     val keepalivesReceived = AtomicInteger(0)
-    /** Last keepalive sender address (for RTT echo tracking). */
-    @Volatile var lastKeepaliveFrom: SocketAddress? = null
-    /** Total REG1 packets received. */
     val reg1Received = AtomicInteger(0)
-    /** Total REG3 confirmations sent. */
     val reg3Sent = AtomicInteger(0)
+    val regNgpSent = AtomicInteger(0)
 
-    // ── Configurable ACK generation ───────────────────────────────────────────
-    /** Whether to auto-send SRTLA ACKs for every data packet. */
-    @Volatile var autoAck: Boolean = false
-    /** ACK accumulation window — send ACK every N data packets. */
-    @Volatile var ackEveryN: Int = 0   // 0 = manual only
+    /** Send an SRTLA ACK for every data packet, on the arrival address. */
+    @Volatile var autoAck: Boolean = true
 
-    private val ackCounter = AtomicInteger(0)
-
-    // ── Latch helpers for test synchronisation ────────────────────────────────
-    /** Latch released when [minUplinks] uplinks have completed REG3. */
-    private var registrationLatch: CountDownLatch = CountDownLatch(Int.MAX_VALUE)
-    private var registrationLatchTarget: Int = Int.MAX_VALUE
-
-    /**
-     * Set up a latch that is released once [count] uplinks have registered (REG3 confirmed).
-     * Must be called before [start].
-     */
-    fun expectRegistrations(count: Int) {
-        registrationLatchTarget = count
-        registrationLatch = CountDownLatch(count)
-    }
-
-    /**
-     * Wait until [expectRegistrations] count is reached (or [timeoutMs] elapses).
-     * Returns true if condition was met.
-     */
-    fun awaitRegistrations(timeoutMs: Long = 3000): Boolean =
-        registrationLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
-
-    // ── Start / stop ──────────────────────────────────────────────────────────
+    /** When false, drop every inbound packet (simulates a dead receiver). */
+    @Volatile var answering: Boolean = true
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        socket.soTimeout = 200   // 200 ms poll so we can check running flag
-        readerThread = Thread(::readerLoop, "mock-receiver-${port}").also {
+        socket.soTimeout = 200
+        readerThread = Thread(::readerLoop, "mock-receiver-$port").also {
             it.isDaemon = true
             it.start()
         }
@@ -126,206 +64,105 @@ class MockSrtlaReceiver {
         readerThread?.join(1000)
     }
 
-    // ── Reader loop ───────────────────────────────────────────────────────────
-
     private fun readerLoop() {
         val buf = ByteArray(MTU + 100)
         val pkt = DatagramPacket(buf, buf.size)
         while (running.get()) {
             try {
                 socket.receive(pkt)
-                val data = buf.copyOf(pkt.length)
-                val from = pkt.socketAddress
-                handlePacket(data, from)
+                if (!answering) continue
+                handlePacket(buf.copyOf(pkt.length), pkt.socketAddress)
             } catch (_: java.net.SocketTimeoutException) {
-                /* poll timeout — check running */
             } catch (_: java.net.SocketException) {
-                break  // socket closed
-            } catch (e: Exception) {
-                /* ignore individual packet errors */
+                break
+            } catch (_: Exception) {
             }
         }
     }
 
     private fun handlePacket(data: ByteArray, from: SocketAddress) {
-        val pt = getPacketType(data) ?: return
-
-        when (pt) {
+        when (getPacketType(data) ?: return) {
             SRTLA_TYPE_REG1 -> handleReg1(data, from)
-            SRTLA_TYPE_REG2 -> handleReg2Client(data, from)
-            SRTLA_TYPE_KEEPALIVE -> handleKeepalive(data, from)
+            SRTLA_TYPE_REG2 -> handleReg2(data, from)
+            SRTLA_TYPE_KEEPALIVE -> {
+                keepalivesReceived.incrementAndGet()
+                send(data, from)
+            }
             else -> {
-                // SRT data or control packet
-                if (isSrtData(data)) {
-                    srtDataPacketsReceived.incrementAndGet()
-                    maybeSendAutoAck(data, from)
-                }
-                // Other SRT control (ACK, NAK) — ignore for now
+                val seq = getSrtSequenceNumber(data) ?: return
+                srtDataPacketsReceived.incrementAndGet()
+                if (isSrtDataRetransmit(data)) retransmitFlaggedReceived.incrementAndGet()
+                synchronized(lock) { seenSeqs.add(seq) }
+                if (autoAck) send(createAckPacket(intArrayOf(seq)), from)
             }
         }
     }
-
-    // ── REG1 → REG2 handshake ─────────────────────────────────────────────────
 
     private fun handleReg1(data: ByteArray, from: SocketAddress) {
         if (data.size < 2 + SRTLA_ID_LEN) return
         reg1Received.incrementAndGet()
-
-        // Extract sender's ID (bytes 2..257)
-        val senderId = data.copyOfRange(2, 2 + SRTLA_ID_LEN)
-
-        // Modify last 128 bytes — mirrors irlserver receiver behaviour
-        val modifiedId = senderId.copyOf()
-        for (i in 128 until SRTLA_ID_LEN) {
-            modifiedId[i] = (modifiedId[i].toInt() xor 0x55).toByte()
-        }
-
-        synchronized(lock) {
-            pendingReg2[from] = modifiedId
-        }
-
-        // Send REG2 with modified ID
-        val reg2 = createReg2Packet(modifiedId)
-        send(reg2, from)
+        val id = data.copyOfRange(2, 2 + SRTLA_ID_LEN)
+        for (i in SRTLA_ID_LEN / 2 until SRTLA_ID_LEN) id[i] = (id[i].toInt() xor 0x55).toByte()
+        synchronized(lock) { mintedIds.add(id) }
+        send(createReg2Packet(id), from)
     }
 
-    private fun handleReg2Client(data: ByteArray, from: SocketAddress) {
-        // Sender broadcasts REG2 (with server-modified ID) to confirm group join
+    private fun handleReg2(data: ByteArray, from: SocketAddress) {
         if (data.size < 2 + SRTLA_ID_LEN) return
-        val receivedId = data.copyOfRange(2, 2 + SRTLA_ID_LEN)
-
-        synchronized(lock) {
-            // Accept: store in registered uplinks
-            val entry = UplinkEntry(addr = from, groupId = receivedId)
-            registeredUplinks[from] = entry
-        }
-
-        // Reply with REG3 to confirm
-        val reg3 = createReg3Packet()
-        send(reg3, from)
-
-        reg3Sent.incrementAndGet()
-
-        // Release registration latch if target reached
-        synchronized(lock) {
-            if (registeredUplinks.size >= registrationLatchTarget) {
-                // Count down remaining (idempotent — latch won't go negative)
-                repeat(registrationLatch.count.toInt()) { registrationLatch.countDown() }
-            }
-        }
-    }
-
-    // ── Keepalive echo ────────────────────────────────────────────────────────
-
-    private fun handleKeepalive(data: ByteArray, from: SocketAddress) {
-        keepalivesReceived.incrementAndGet()
-        lastKeepaliveFrom = from
-        // Echo packet back verbatim — sender uses timestamp to measure RTT
-        send(data, from)
-    }
-
-    // ── Auto-ACK ─────────────────────────────────────────────────────────────
-
-    private fun maybeSendAutoAck(data: ByteArray, from: SocketAddress) {
-        val seq = getSrtSequenceNumber(data) ?: return
-
-        if (autoAck) {
-            val ack = createAckPacket(listOf(seq))
-            send(ack, from)
+        val id = data.copyOfRange(2, 2 + SRTLA_ID_LEN)
+        val known = synchronized(lock) { mintedIds.any { it.contentEquals(id) } }
+        if (!known) {
+            regNgpSent.incrementAndGet()
+            send(byteArrayOf(0x92.toByte(), 0x11), from) // REG_NGP
             return
         }
-
-        if (ackEveryN > 0) {
-            val n = ackCounter.incrementAndGet()
-            if (n % ackEveryN == 0) {
-                val ack = createAckPacket(listOf(seq))
-                send(ack, from)
-            }
-        }
+        synchronized(lock) { registered.add(from) }
+        reg3Sent.incrementAndGet()
+        send(createReg3Packet(), from)
     }
 
-    // ── Manual ACK / NAK injection ────────────────────────────────────────────
-
-    /**
-     * Send an SRTLA ACK for [seqs] to [targetAddr].
-     * If [targetAddr] is null, broadcasts to all registered uplinks.
-     */
-    fun sendAck(seqs: List<Long>, targetAddr: SocketAddress? = null) {
-        val pkt = createAckPacket(seqs)
-        val targets = if (targetAddr != null) {
-            listOf(targetAddr)
-        } else {
-            synchronized(lock) { registeredUplinks.keys.toList() }
-        }
-        for (addr in targets) send(pkt, addr)
+    /** SRT ACK (cumulative) with [ackSeq] at bytes 16..19, to one or every uplink. */
+    fun sendSrtAck(ackSeq: Int, timestamp: Int = 1, to: SocketAddress? = null) {
+        val pkt = ByteArray(44)
+        writeU16BE(pkt, 0, SRT_TYPE_ACK)
+        writeI32BE(pkt, 8, timestamp)
+        writeI32BE(pkt, 16, ackSeq)
+        for (addr in targets(to)) send(pkt, addr)
     }
 
-    /**
-     * Inject a NAK for [seqs] to [targetAddr].
-     * Builds a minimal SRT NAK packet and sends it.
-     * If [targetAddr] is null, sends to all registered uplinks.
-     */
-    fun injectNak(seqs: List<Long>, targetAddr: SocketAddress? = null) {
-        val nak = buildNakPacket(seqs)
-        val targets = if (targetAddr != null) {
-            listOf(targetAddr)
-        } else {
-            synchronized(lock) { registeredUplinks.keys.toList() }
-        }
-        for (addr in targets) {
-            send(nak, addr)
-            synchronized(lock) {
-                registeredUplinks[addr]?.nakCount?.incrementAndGet()
-            }
-        }
+    /** SRT NAK whose loss list (after the 16-byte control header) holds [seqs]. */
+    fun injectNak(seqs: IntArray, to: SocketAddress? = null) {
+        val pkt = ByteArray(SRT_CONTROL_HEADER_LEN + 4 * seqs.size)
+        writeU16BE(pkt, 0, SRT_TYPE_NAK)
+        for ((i, s) in seqs.withIndex()) writeI32BE(pkt, SRT_CONTROL_HEADER_LEN + 4 * i, s and 0x7FFF_FFFF)
+        for (addr in targets(to)) send(pkt, addr)
     }
 
-    /** Build a minimal SRT NAK packet for [seqs] (single-value entries only). */
-    private fun buildNakPacket(seqs: List<Long>): ByteArray {
-        val payload = ByteArray(4 + 4 * seqs.size)
-        writeU16BE(payload, 0, SRT_TYPE_NAK)
-        writeU16BE(payload, 2, 0)  // reserved
-        for ((i, seq) in seqs.withIndex()) {
-            writeU32BE(payload, 4 + i * 4, seq and 0x7FFF_FFFFL)  // clear range-bit
-        }
-        return payload
-    }
+    private fun targets(to: SocketAddress?): List<SocketAddress> =
+        if (to != null) listOf(to) else registeredUplinkAddresses()
 
-    // ── Query helpers ─────────────────────────────────────────────────────────
+    fun registeredUplinkAddresses(): List<SocketAddress> = synchronized(lock) { registered.toList() }
 
-    /** Return a snapshot of currently registered uplink addresses. */
-    fun registeredUplinkAddresses(): List<SocketAddress> =
-        synchronized(lock) { registeredUplinks.keys.toList() }
+    fun registeredCount(): Int = synchronized(lock) { registered.size }
 
-    /** How many uplinks are currently registered. */
-    fun registeredCount(): Int =
-        synchronized(lock) { registeredUplinks.size }
+    fun distinctSeqCount(): Int = synchronized(lock) { seenSeqs.size }
 
-    /** Wait (polling) until [minCount] uplinks are registered or timeout. */
-    fun pollUntilRegistered(minCount: Int, timeoutMs: Long = 3000): Boolean {
+    fun pollUntil(timeoutMs: Long = 5000, cond: () -> Boolean): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            if (registeredCount() >= minCount) return true
+            if (cond()) return true
             Thread.sleep(20)
         }
-        return false
+        return cond()
     }
 
-    // ── Send helper ───────────────────────────────────────────────────────────
+    fun pollUntilRegistered(minCount: Int, timeoutMs: Long = 8000): Boolean =
+        pollUntil(timeoutMs) { registeredCount() >= minCount }
 
     private fun send(data: ByteArray, to: SocketAddress) {
         try {
-            if (socket.isClosed) return
-            val pkt = DatagramPacket(data, data.size, to)
-            socket.send(pkt)
-        } catch (_: Exception) {}
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    /** Returns true if [data] is an SRT data packet (MSB of first byte = 0). */
-    private fun isSrtData(data: ByteArray): Boolean {
-        if (data.size < 4) return false
-        return (data[0].toInt() and 0x80) == 0
+            if (!socket.isClosed) socket.send(DatagramPacket(data, data.size, to))
+        } catch (_: Exception) {
+        }
     }
 }

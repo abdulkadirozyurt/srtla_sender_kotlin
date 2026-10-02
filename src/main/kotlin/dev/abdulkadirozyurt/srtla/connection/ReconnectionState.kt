@@ -1,61 +1,80 @@
-// Ported from irlserver/srtla_send v3.0.0 (MIT)
-// Source: src/connection/reconnection.rs
-//
-// Reconnection state and exponential backoff tracking.
+// Ported from irlserver/srtla_send v4.1.0 (MIT)
+// Source: crates/srtla-core/src/connection/reconnection.rs
 package dev.abdulkadirozyurt.srtla.connection
 
-// src/connection/reconnection.rs
-private const val BASE_RECONNECT_DELAY_MS: Long = 5_000L
-private const val MAX_BACKOFF_DELAY_MS: Long = 120_000L
-private const val MAX_BACKOFF_COUNT: Int = 5
+import dev.abdulkadirozyurt.srtla.core.satSub
+import java.util.logging.Logger
+
+private val log: Logger = Logger.getLogger("srtla.reconnection")
 
 /**
- * Reconnection state and backoff tracking.
- * Mirrors Rust `struct ReconnectionState` in src/connection/reconnection.rs.
+ * Attempts an established link makes at the housekeeping cadence before it slows
+ * down. SRT drops the session after 5 s of silence, so a sub-second blip must be
+ * retried on the next tick.
  */
-class ReconnectionState {
-    var lastReconnectAttemptMs: Long = 0L
-    var reconnectFailureCount: Int = 0
-    var connectionEstablishedMs: Long = 0L
-    var startupGraceDeadlineMs: Long = 0L
+internal const val FAST_RETRY_ATTEMPTS: Int = 4
+private const val FAST_RETRY_DELAY_MS: Long = 1000L
 
-    /** Calculate backoff delay based on failure count. */
-    private fun backoffDelay(): Long {
-        val capped = minOf(reconnectFailureCount, MAX_BACKOFF_COUNT)
-        val delay = BASE_RECONNECT_DELAY_MS * (1L shl capped)
-        return minOf(delay, MAX_BACKOFF_DELAY_MS)
-    }
+/**
+ * Cadence once the fast attempts are spent. Each retry rebuilds the socket,
+ * which drops any REG2 answer still in flight, so a slow modem gets 5 s per try.
+ * No exponential backoff: a link back after minutes must not wait minutes more.
+ */
+internal const val SLOW_RETRY_DELAY_MS: Long = 5000L
 
+/**
+ * Attempts are stamped with the time their tick was serviced; half a tick of
+ * slack keeps a retry on the tick it is due despite service jitter.
+ */
+private const val TICK_SLACK_MS: Long = 500L
+
+private fun elapsedReaches(now: Long, since: Long, delayMs: Long): Boolean =
+    now.satSub(since) + TICK_SLACK_MS >= delayMs
+
+/** Reconnection state and retry pacing. */
+class ReconnectionState(
+    var lastReconnectAttemptMs: Long = 0L,
     /**
-     * Whether we should attempt reconnection now.
-     * Mirrors Rust `ReconnectionState::should_attempt_reconnect`.
+     * Attempts since the link last completed registration (REG3). A successful
+     * socket rebuild does not reset it: only the receiver's answer proves the
+     * link is back.
      */
-    fun shouldAttemptReconnect(): Boolean {
-        val now = System.currentTimeMillis()
+    var reconnectFailureCount: Int = 0,
+    var connectionEstablishedMs: Long = 0L,
+    var startupGraceDeadlineMs: Long = 0L,
+) {
+    private fun retryDelay(): Long =
+        if (reconnectFailureCount < FAST_RETRY_ATTEMPTS) FAST_RETRY_DELAY_MS else SLOW_RETRY_DELAY_MS
+
+    fun shouldAttemptReconnect(now: Long): Boolean {
         if (connectionEstablishedMs == 0L) {
             if (now <= startupGraceDeadlineMs) return false
+            // Initial registration retries once per housekeeping pass, like C.
             if (lastReconnectAttemptMs == 0L) return true
-            return (now - lastReconnectAttemptMs) >= 1000L
+            return elapsedReaches(now, lastReconnectAttemptMs, FAST_RETRY_DELAY_MS)
         }
         if (lastReconnectAttemptMs == 0L) return true
-        val timeSinceLast = now - lastReconnectAttemptMs
-        return timeSinceLast >= backoffDelay()
+        return elapsedReaches(now, lastReconnectAttemptMs, retryDelay())
     }
 
-    /** Record a reconnection attempt. */
-    fun recordAttempt(label: String) {
-        lastReconnectAttemptMs = System.currentTimeMillis()
-        if (connectionEstablishedMs == 0L) return
-        reconnectFailureCount++
+    fun recordAttempt(label: String, now: Long) {
+        lastReconnectAttemptMs = now
+        if (connectionEstablishedMs == 0L) {
+            log.fine { "$label: Initial registration retry scheduled (next attempt in ~1s)" }
+            return
+        }
+        if (reconnectFailureCount < Int.MAX_VALUE) reconnectFailureCount++
+        log.info("$label: Reconnect attempt #$reconnectFailureCount, next attempt in ${retryDelay() / 1000}s")
     }
 
-    /** Mark reconnection as successful — resets backoff. */
     fun markSuccess(label: String) {
-        reconnectFailureCount = 0
+        if (reconnectFailureCount > 0) {
+            log.info("$label: Reconnection successful, resetting retry pacing")
+            reconnectFailureCount = 0
+        }
     }
 
-    /** Reset the startup grace period (now + STARTUP_GRACE_MS). */
-    fun resetStartupGrace() {
-        startupGraceDeadlineMs = System.currentTimeMillis() + STARTUP_GRACE_MS
+    fun resetStartupGrace(now: Long) {
+        startupGraceDeadlineMs = now + STARTUP_GRACE_MS
     }
 }

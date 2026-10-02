@@ -7,3 +7,5 @@ local.properties
 # Gradle wrapper jar is intentionally tracked
 !gradle/wrapper/gradle-wrapper.jar
 .vscode/
+# Kotlin 2.x compiler session data
+.kotlin/

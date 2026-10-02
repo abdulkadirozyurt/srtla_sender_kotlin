@@ -1,42 +1,40 @@
 # srtla-sender-kotlin
 
 A JVM (Kotlin/JDK 11) port of [irlserver/srtla_send](https://github.com/irlserver/srtla_send)
-v3.0.0 — a multi-uplink SRTLA bonding sender.
+v4.1.0 — a multi-uplink SRTLA bonding sender.
 
 ---
 
 ## Quick Start
 
-### Build (requires Kotlin compiler)
+### Build
 
 ```bash
-# Compile all sources
-kotlinc $(find src -name "*.kt") -d srtla.jar
-
-# Or with Gradle (on a machine with internet / Gradle cache)
+# With Gradle (requires JDK 11+)
 ./gradlew build
 ```
 
 ### Run the sender
 
 ```bash
-java -cp srtla.jar:$KOTLIN_HOME/lib/kotlin-stdlib.jar \
+# Via Gradle
+./gradlew run --args="6000 receiver.example.com 5000 /etc/srtla/uplinks.txt"
+
+# Or directly with the built JAR (JDK 11+)
+java -cp build/libs/srtla_sender_kotlin-all.jar \
   dev.abdulkadirozyurt.srtla.cli.MainKt \
-  --receiver-host live.example.com \
-  --receiver-port 5000 \
-  --ip-file /etc/srtla/uplinks.txt \
-  --srt-port 1935
+  6000 receiver.example.com 5000 /etc/srtla/uplinks.txt
 ```
 
 ### `uplinks.txt` format
 
-One IP address per line. Comments (`#`) and blank lines are ignored.
+One IP per line, with optional weight (1..10, classic mode only). Comments (`#`) and blank lines are ignored.
 
 ```
 192.168.1.10
-10.0.0.5
-# cellular modem
-172.16.0.3
+10.0.0.5 2
+# cellular modem, weight 3
+172.16.0.3 3
 ```
 
 ---
@@ -71,53 +69,33 @@ transitive dependencies to manage.
 
 ```kotlin
 import dev.abdulkadirozyurt.srtla.config.DynamicConfig
-import dev.abdulkadirozyurt.srtla.config.applyCmd
-import dev.abdulkadirozyurt.srtla.sender.Housekeeping
+import dev.abdulkadirozyurt.srtla.core.CriticalWindow
+import dev.abdulkadirozyurt.srtla.core.SchedulingMode
+import dev.abdulkadirozyurt.srtla.net.UplinkBinder
 import dev.abdulkadirozyurt.srtla.sender.SrtlaSender
-import dev.abdulkadirozyurt.srtla.sender.selection.SchedulingMode
-import dev.abdulkadirozyurt.srtla.stats.SharedStats
-import java.net.InetAddress
+import dev.abdulkadirozyurt.srtla.telemetry.SharedStats
+import dev.abdulkadirozyurt.srtla.telemetry.SubscriptionHub
 
-// 1. Runtime-tunable configuration (thread-safe, atomics-based)
-val config = DynamicConfig.fromCli(mode = SchedulingMode.ENHANCED)
-val stats  = SharedStats()
-
-// 2. Create the sender: local SRT ingest port -> SRTLA receiver, over N uplinks
+val config = DynamicConfig(mode = SchedulingMode.ENHANCED)
+val stats = SharedStats()
 val sender = SrtlaSender(
-    localSrtPort = 6000,                       // your SRT encoder sends to udp://127.0.0.1:6000
-    receiverHost = "receiver.example.com",     // srtla_rec host
+    localSrtPort = 6000,
+    receiverHost = "rec.example.com",
     receiverPort = 5000,
-    sourceIps    = listOf(
-        InetAddress.getByName("192.168.0.2"),  // uplink 1 (e.g. modem A)
-        InetAddress.getByName("192.168.1.2"),  // uplink 2 (e.g. modem B)
-    ),
-    config = config.snapshot(),
-    // socketFactory = ...                     // see Android Integration below
-)
-sender.start()
-
-// 3. Housekeeping loop (keepalives, timeouts, window recovery, stats refresh).
-//    Run on your own scheduler/thread; tick every ~100 ms.
-var lastStatusLogMs = 0L
-val housekeeper = Thread {
-    while (!Thread.currentThread().isInterrupted) {
-        lastStatusLogMs = Housekeeping.tick(sender, config, stats, lastStatusLogMs)
-        Thread.sleep(100)
+    ipsFile = "/data/uplinks.txt",
+    config = config,
+    stats = stats,
+    criticalWindow = CriticalWindow(),
+    hub = SubscriptionHub(),
+    binder = UplinkBinder { channel, ip ->
+        // Android: network.bindSocket(channel.socket())
+        channel.bind(java.net.InetSocketAddress(ip, 0))
     }
-}.apply { isDaemon = true; start() }
-
-// 4. Observe per-link telemetry (bitrate, RTT, window, in-flight, quality)
-val snapshot = stats.get()        // typed snapshot
-val json     = stats.toJson()     // or JSON for UI/IPC
-
-// 5. Change behaviour at runtime — same commands as the CLI control channel
-applyCmd(config, "mode rtt-threshold")
-applyCmd(config, "rtt-delta 50")
-applyCmd(config, "quality off")
-
-// 6. Shutdown
-housekeeper.interrupt()
-sender.stop()
+)
+val t = Thread { sender.run() }.apply { start() }   // blocks until stop()
+config.setMode(SchedulingMode.CLASSIC)               // runtime switch
+println(stats.toJson())                              // per-link telemetry, refreshed every second
+sender.stop()                                         // from any thread
 ```
 
 Point your SRT encoder (FFmpeg, OBS, RootEncoder, srt-live-transmit, ...) at
@@ -126,71 +104,96 @@ uplinks towards the SRTLA receiver.
 
 ### Using from an Android app
 
-Everything above works on Android (minSdk with JDK-11 desugaring not required —
+Everything above works on Android (no desugaring needed —
 the library uses only `java.nio` and `java.util.concurrent`). Two Android-specific
 concerns are covered in [Android Integration](#android-integration):
 
 - bind each uplink to a specific `Network` (Wi-Fi + cellular simultaneously) by
-  injecting a custom `UplinkSocketFactory` backed by `ConnectivityManager`
+  passing a custom `UplinkBinder` backed by `ConnectivityManager`
 - request the cellular network with `requestNetwork` while Wi-Fi is up, and run
   the sender inside a foreground service for IRL streaming use cases
 
 ## CLI Arguments
 
-| Argument | Default | Description |
+Positional arguments (required in order):
+- `SRT_LISTEN_PORT`: Local UDP port for SRT encoder input
+- `SRTLA_HOST`: Receiver hostname or IP
+- `SRTLA_PORT`: Receiver UDP port
+- `BIND_IPS_FILE`: Path to uplinks file (`<ip> [weight]` per line)
+
+Options (in any order):
+| Option | Default | Description |
 |---|---|---|
-| `--receiver-host <host>` | *(required)* | SRTLA receiver hostname or IP |
-| `--receiver-port <port>` | *(required)* | SRTLA receiver UDP port |
-| `--ip-file <path>` | *(required)* | Path to IP list file |
-| `--srt-port <port>` | `1935` | Local UDP port where the SRT encoder connects |
-| `--mode <mode>` | `enhanced` | Scheduling mode: `classic`, `enhanced`, `rtt-threshold`, `edpf` |
-| `--no-quality` | off | Disable quality scoring (enhanced/rtt-threshold modes) |
-| `--exploration` | off | Enable smart link exploration (enhanced mode only) |
-| `--rtt-delta-ms <ms>` | `30` | RTT grouping threshold for rtt-threshold mode |
-| `--control-port <port>` | *(none)* | Enable TCP control server on `127.0.0.1:<port>` |
+| `--mode <MODE>` | `enhanced` | Scheduling: `classic` or `enhanced` |
+| `--no-quality` | off | Disable quality scoring (enhanced mode) |
+| `--no-stall-deselect` | off | Disable stalled-link deselect guard (on by default) |
+| `--stall-min-in-flight <N>` | `32` | In-flight backlog threshold for stall candidate |
+| `--stall-ack-stale-ms <MS>` | `3000` | Delivery-proof staleness window |
+| `--conn-timeout-ms <MS>` | `5000` | Per-link liveness timeout (1000..60000) |
+| `--no-rehome` | off | Disable whole-bond re-home on DNS change |
+| `--config <PATH>` | *(none)* | TOML config file (flags override file) |
+| `--control-socket <PATH>` | *(none)* | Unix domain socket for JSON-RPC (JDK 16+) |
+| `--control-port <PORT>` | *(none)* | Loopback TCP port for JSON-RPC |
+| `--priority-bind <ADDR:PORT>` | *(none)* | UDP sidecar for keyframe priority hints |
+| `--metrics-bind <ADDR:PORT>` | *(none)* | Prometheus `/metrics` endpoint |
+| `-v, --version` | *(none)* | Print version and exit |
+| `-h, --help` | *(none)* | Print help |
 
 ### Examples
 
 ```bash
-# Classic mode (original C-compatible behaviour)
-java -jar srtla.jar --receiver-host relay.isp.net --receiver-port 5000 \
-  --ip-file uplinks.txt --mode classic
+# Classic mode (original behaviour)
+./gradlew run --args="--mode classic 6000 rec.example.com 5000 uplinks.txt"
 
-# Enhanced mode with exploration, RTT delta 50ms
-java -jar srtla.jar --receiver-host relay.isp.net --receiver-port 5000 \
-  --ip-file uplinks.txt --mode enhanced --exploration --rtt-delta-ms 50
+# Enhanced mode (default)
+./gradlew run --args="6000 rec.example.com 5000 uplinks.txt"
 
-# With TCP control server on port 9090
-java -jar srtla.jar --receiver-host relay.isp.net --receiver-port 5000 \
-  --ip-file uplinks.txt --control-port 9090
+# With TCP control on port 9090
+./gradlew run --args="--control-port 9090 6000 rec.example.com 5000 uplinks.txt"
+
+# With Prometheus metrics and priority hints
+./gradlew run --args="--metrics-bind 127.0.0.1:9099 --priority-bind 127.0.0.1:7000 \
+  6000 rec.example.com 5000 uplinks.txt"
+
+# From TOML config + CLI override
+./gradlew run --args="--config srtla.toml --mode enhanced 6000 rec.example.com 5000 uplinks.txt"
 ```
 
 ---
 
-## Runtime Control Commands
+## Runtime Control Protocol
 
-Commands are sent line-by-line via **stdin** or via a **TCP control connection** to
-`127.0.0.1:<control-port>`.
+Commands use **JSON-RPC 2.0**, one request per line, over **stdin**, a loopback **TCP socket** (`--control-port`)
+or a **Unix domain socket** (`--control-socket`, JDK 16+).
+Full reference: [docs/CONTROL_PROTOCOL.md](docs/CONTROL_PROTOCOL.md)
 
-| Command | Description |
-|---|---|
-| `mode classic` | Switch to classic (capacity-only) selection |
-| `mode enhanced` | Switch to enhanced (quality-aware) selection |
-| `mode rtt-threshold` | Switch to RTT-grouped selection |
-| `mode edpf` | Switch to BLEST→IoDS→EDPF pipeline |
-| `quality on\|off` | Enable/disable quality scoring |
-| `explore on\|off` | Enable/disable link exploration |
-| `rtt-delta <ms>` | Set RTT grouping threshold |
-| `status` | Print current mode and configuration |
-| `stats` | Print per-link JSON telemetry |
-| `reload` | Reload IP list from file |
+Methods:
+- `set_mode { "mode": "classic"|"enhanced" }` — switch scheduling mode
+- `set_quality { "enabled": true|false }` — enable/disable quality scoring
+- `set_stall_deselect { "enabled": true|false }` — stalled-link guard
+- `set_conn_timeout { "ms": <1000..60000> }` — per-link liveness timeout (the reply echoes the clamped value)
+- `get_status` — current config and priority-window counters
+- `get_stats` — per-link telemetry JSON
+- `subscribe { "topic": "stats"|"priority.window" }`, `unsubscribe { "subscription_id": "..." }`,
+  `get_subscription_count` — push notifications (socket connections only, not stdin)
 
-### Example (TCP control)
+To reload the IPs file, send `SIGHUP` to the process. Where the runtime has no
+`sun.misc.Signal`, the sender watches the IPs file and reloads it when it changes.
+
+### Example (TCP control, JSON-RPC 2.0)
 
 ```bash
-echo "status" | nc 127.0.0.1 9090
-echo "mode enhanced" | nc 127.0.0.1 9090
-echo "stats" | nc 127.0.0.1 9090
+# Start with control port
+./gradlew run --args="--control-port 9090 6000 rec.example.com 5000 uplinks.txt"
+
+# Query status
+echo '{"jsonrpc":"2.0","id":1,"method":"get_status"}' | nc 127.0.0.1 9090
+
+# Switch to classic mode
+echo '{"jsonrpc":"2.0","id":2,"method":"set_mode","params":{"mode":"classic"}}' | nc 127.0.0.1 9090
+
+# Get stats
+echo '{"jsonrpc":"2.0","id":3,"method":"get_stats"}' | nc 127.0.0.1 9090
 ```
 
 ---
@@ -201,36 +204,31 @@ echo "stats" | nc 127.0.0.1 9090
 ┌─────────────────────────────────────────────────────┐
 │                    SrtlaSender                      │
 │                                                     │
-│  srt-listener thread                                │
-│    Reads SRT UDP packets from encoder               │
-│    → acquires stateLock                             │
-│    → drains inboundQueue (up to 64 packets)         │
-│    → selects uplink via SelectionOrchestrator       │
-│    → sends on selected uplink socket                │
+│  event-loop thread  (one NIO Selector)              │
+│    owns ALL connection state, no locks              │
+│    → SRT listener: encoder packets → select uplink  │
+│      (classic / enhanced) → batch queue             │
+│    → uplink sockets: SRTLA ACK/NAK/keepalive,       │
+│      registration, SRT ACK/NAK relay to encoder     │
+│    → every 15 ms: flush batch queues                │
+│    → every 1 s: housekeeping — keepalives,          │
+│      registration driver, timeouts, reconnects      │
+│      (1 s ×4 then 5 s), link CC, stats, re-home     │
 │                                                     │
-│  uplink-<label> thread  (one per uplink)            │
-│    Blocking recv on DatagramChannel                 │
-│    → enqueues into inboundQueue (lock-free)         │
-│                                                     │
-│  housekeeping thread  (1 Hz)                        │
-│    → sends keepalives (IDLE_TIME = 1s)              │
-│    → drives RegistrationManager state machine       │
-│    → detects timeouts (CONN_TIMEOUT = 5s)           │
-│    → triggers reconnects (exponential backoff)      │
-│    → updates SharedStats, logs status every 30s     │
-│                                                     │
-│  [optional] ctrl-stdin thread                       │
-│  [optional] ctrl-tcp-server thread                  │
-│    Both call applyCmd() — lock-free via atomics     │
+│  [optional] control threads (stdin / TCP / Unix)    │
+│  [optional] metrics HTTP thread (/metrics)          │
+│  [optional] priority sidecar thread (UDP)           │
+│    talk to the loop only through atomics            │
+│    (DynamicConfig, SharedStats, CriticalWindow)     │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Locking strategy:**
-- A single `ReentrantLock` (`stateLock`) protects the connections list, registration
-  manager, last-selected index, and sequence tracker.
-- Per-uplink reader threads enqueue via `LinkedBlockingQueue` (lock-free produce).
-- `DynamicConfig` fields are all `AtomicReference`/`AtomicBoolean`/`AtomicInteger` —
-  no lock needed for config reads.
+**Concurrency:**
+- The event-loop thread is the single owner of the connections, registration
+  manager, sequence tracker and batch queues, like upstream's single tokio task.
+- `DynamicConfig` fields are atomics; the loop reads one `ConfigSnapshot` per tick.
+- `SharedStats` is replaced as a whole each second; readers never see a torn update.
+- `stop()` and `requestIpReload()` are safe to call from any thread; they wake the selector.
 
 ---
 
@@ -238,124 +236,97 @@ echo "stats" | nc 127.0.0.1 9090
 
 | Mode | Algorithm | Notes |
 |---|---|---|
-| `classic` | Capacity-only (`window / (in_flight + 1)`) | Matches original C implementation |
-| `enhanced` | Quality-aware + hysteresis + optional exploration | Default |
-| `rtt-threshold` | RTT group buckets + quality within group | Good for mixed-latency links |
-| `edpf` | BLEST → IoDS → EDPF argmin pipeline | Latency-optimised |
+| `classic` | Capacity-only, with link weights (`window / (in_flight + 1)`) | Matches original C implementation; weights from IP file |
+| `enhanced` | Quality-aware (NAK decay, burst detection, RTT bonus) + hysteresis + stall detection | Default; applies weak-link classifier, link CC, sole-carrier sticky routing |
 
 ---
 
 ## Android Integration
 
-### UplinkSocketFactory
-
-The `UplinkSocketFactory` interface abstracts socket creation, allowing Android's
-`ConnectivityManager` / `Network.bindSocket` pattern to be injected:
+The sender runs on Android (minSdk 24+, or with JDK-11 desugaring). The `UplinkBinder` 
+functional interface lets you bind uplink sockets to specific `Network` objects via 
+`ConnectivityManager`:
 
 ```kotlin
 import android.net.ConnectivityManager
 import android.net.Network
-import dev.abdulkadirozyurt.srtla.connection.UplinkSocketFactory
+import dev.abdulkadirozyurt.srtla.net.UplinkBinder
 import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.nio.channels.DatagramChannel
 
-class AndroidUplinkSocketFactory(
-    private val cm: ConnectivityManager,
-) : UplinkSocketFactory {
+val cm: ConnectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
-    override fun createAndBind(
-        sourceIp: InetAddress,
-        remoteAddr: InetSocketAddress,
-    ): DatagramChannel {
-        // Find the Network whose link-local address matches sourceIp
-        val network: Network = cm.allNetworks
-            .firstOrNull { net ->
-                cm.getLinkProperties(net)
-                    ?.linkAddresses
-                    ?.any { la -> la.address == sourceIp }
-                    ?: false
-            }
-            ?: error("No network found for $sourceIp")
-
-        val ch = DatagramChannel.open()
-        // Bind the socket to this specific network interface
-        network.bindSocket(ch.socket())
-        ch.socket().bind(InetSocketAddress(sourceIp, 0))
-        ch.connect(remoteAddr)
-        ch.configureBlocking(false)
-        return ch
-    }
-}
-```
-
-Then pass it to `SrtlaSender`:
-
-```kotlin
-val factory = AndroidUplinkSocketFactory(connectivityManager)
 val sender = SrtlaSender(
-    localSrtPort  = 1935,
-    receiverHost  = "relay.example.com",
-    receiverPort  = 5000,
-    sourceIps     = listOf(wifiIp, cellIp),
-    socketFactory = factory,
+    localSrtPort = 6000,
+    receiverHost = "rec.example.com",
+    receiverPort = 5000,
+    ipsFile = "/data/srtla/uplinks.txt",  // or load IPs dynamically
+    config = config,
+    stats = stats,
+    criticalWindow = CriticalWindow(),
+    hub = SubscriptionHub(),
+    binder = UplinkBinder { channel, ip ->
+        // Find the Network bound to this IP
+        val network: Network = cm.allNetworks.firstOrNull { net ->
+            cm.getLinkProperties(net)?.linkAddresses?.any { la -> la.address == ip } ?: false
+        } ?: error("No network for $ip")
+        // Bind the socket to that network
+        network.bindSocket(channel.socket())
+        channel.bind(java.net.InetSocketAddress(ip, 0))
+    }
 )
-sender.start()
+Thread { sender.run() }.start()
 ```
 
-> **Note:** On Android, enumerate source IPs from `ConnectivityManager.allNetworks` +
-> `getLinkProperties(net).linkAddresses` rather than from a static IP file.
+For dynamic uplink discovery, enumerate networks from `ConnectivityManager.allNetworks` 
++ `getLinkProperties(net).linkAddresses` instead of a static IP file. Wrap the sender 
+in a foreground service for long-running IRL streams.
 
 ### Logging on Android
 
-The JVM sender uses `java.util.logging` (JUL). To redirect logs to Android Logcat,
-install a custom `Handler` at startup:
+The sender uses `java.util.logging` (JUL). Redirect to Android Logcat with a custom handler:
 
 ```kotlin
-val root = java.util.logging.Logger.getLogger("")
-root.addHandler(object : java.util.logging.Handler() {
-    override fun publish(r: java.util.logging.LogRecord) {
-        android.util.Log.d("SRTLA/${r.loggerName}", r.message)
-    }
-    override fun flush() {}
-    override fun close() {}
-})
+java.util.logging.Logger.getLogger("").apply {
+    addHandler(object : java.util.logging.Handler() {
+        override fun publish(r: java.util.logging.LogRecord) {
+            android.util.Log.d("SRTLA/${r.loggerName}", r.message)
+        }
+        override fun flush() {}
+        override fun close() {}
+    })
+}
 ```
 
-The `SRTLA_LOG` environment variable is not used; configure via the JUL API above.
+The `SRTLA_LOG` environment variable is not available on Android; use the JUL handler above.
 
 ---
 
 ## Running Tests
 
-### Testkit runner (no Gradle / JUnit required)
+Zero-dependency testkit (no JUnit, no external frameworks).
 
 ```bash
-# Compile
-kotlinc $(find src -name "*.kt") -d srtla-test.jar
+# With Gradle (JDK 11–21, Gradle 8.10.2)
+./gradlew test
 
-# Run
-java -cp "srtla-test.jar:$KOTLIN_HOME/lib/kotlin-stdlib.jar" \
-  dev.abdulkadirozyurt.srtla.testkit.TestRunnerKt
+# Run a specific test suite
+./gradlew runTests --args="<suite substring>"
 ```
 
-Expected output: **328 tests: 328 passed, 0 failed**
-
-### With Gradle (recommended)
-
-```bash
-./gradlew test        # runs the full testkit suite (alias: ./gradlew runTests)
-```
+The testkit covers unit tests, integration tests, and end-to-end scenarios. 
+Expected: **all tests pass** with JDK 11+.
 
 ---
 
 ## Deviations from Rust Reference
 
-| Area | Rust (`irlserver/srtla_send`) | This Kotlin port |
+| Area | Rust (`irlserver/srtla_send` v4.1.0) | This Kotlin port |
 |---|---|---|
-| **Control channel** | Unix domain socket (`--control-socket /path`) | TCP server on `127.0.0.1:<port>` (`--control-port N`). JDK 11 has no `UnixDomainSocketAddress` (added in JDK 16). Wire protocol is identical. |
-| **IP reload trigger** | `SIGHUP` Unix signal | `reload` control command + Java `WatchService` on IP file directory. JVM has no reliable cross-platform SIGHUP handling. |
-| **Batch I/O** | `sendmmsg` / `recvmmsg` Linux syscalls | Plain per-packet `DatagramChannel` send/recv. JVM has no `sendmmsg` equivalent. Semantics identical; only syscall overhead differs. |
-| **Async runtime** | Tokio (`select!` macro, async tasks) | Blocking threads (`Thread`, `LinkedBlockingQueue`). JVM `CompletableFuture`/`VirtualThread` are available but not needed for this use case. |
-| **`SRTLA_LOG` env var** | Controls Rust tracing level | Not implemented. Use `java.util.logging` configuration or Android Handler injection instead. |
-| **Probing RTT** | Used to select best uplink for initial REG1 | Same algorithm; uses loopback RTT in test environment. |
+| **Batch I/O** | `sendmmsg` / `recvmmsg` Linux syscalls | Per-packet `DatagramChannel` (NIO Selector event loop). JVM has no batch syscall. Semantics and scoring preserved; overhead differs. |
+| **Unix socket control** | `--control-socket /path` (any OS) | `--control-socket` via reflection (JDK 16+, Unix only). Fallback: `--control-port` (loopback TCP, JVM extension for JDK 11). |
+| **SIGHUP reload** | Direct signal handler | `sun.misc.Signal` (reflection, when available); fallback to Java `WatchService` on IP file directory. JVM lacks portable SIGHUP. |
+| **Monotonic clock** | `Instant` (nanosecond precision) | `System.nanoTime()` (nanosecond, non-wall-clock). No NTP step-back issues. |
+| **TOML parsing** | Upstream `toml` crate | Hand-rolled mini TOML parser (zero dependencies). Supports all v4.1.0 keys. |
+| **JSON serialization** | `serde_json` | Mini JSON serializer (zero dependencies). Emits compact output. |
+| **Thread model** | Tokio async runtime (`select!`) | One NIO Selector event-loop thread + per-uplink reader threads + housekeeping tick (1 s) + optional control threads. No virtual threads. |
+| **`SRTLA_LOG` env var** | Controls `tracing` filter | Environment variable read at startup; configures `java.util.logging` level globally. No dynamic filter support. |

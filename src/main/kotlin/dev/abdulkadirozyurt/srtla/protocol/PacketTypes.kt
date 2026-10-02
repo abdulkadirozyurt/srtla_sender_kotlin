@@ -1,98 +1,87 @@
-// Ported from irlserver/srtla_send v3.0.0 (MIT)
-// Source: src/protocol/types.rs
-//
-// Rust uses plain constants + helper functions rather than an enum for packet
-// type dispatch (enum variants would require exhaustive matching and the
-// protocol adds new types via receiver-side code). We mirror that flat
-// constant approach: getPacketType() returns the raw Int value and callers
-// compare against the SRTLA_TYPE_* / SRT_TYPE_* constants.
-//
-// The ConnectionInfo data class mirrors the Rust struct ConnectionInfo.
-// Field types:
-//   conn_id (u32)             -> Long  (mask 0xFFFFFFFFL on decode)
-//   window  (i32)             -> Int
-//   in_flight (i32)           -> Int
-//   rtt_ms (u32)              -> Long  (mask 0xFFFFFFFFL on decode)
-//   nak_count (u32)           -> Long
-//   bitrate_bytes_per_sec(u32)-> Long
+// Ported from irlserver/srtla_send v4.1.0 (MIT)
+// Source: crates/srtla-protocol/src/types.rs
 package dev.abdulkadirozyurt.srtla.protocol
 
 /**
  * Connection info payload embedded in extended KEEPALIVE packets.
- * Mirrors Rust `struct ConnectionInfo` in src/protocol/types.rs.
- *
- * All originally-unsigned u32 fields are stored as Long to avoid signed
- * overflow; i32 fields remain Int (same width, same sign semantics).
+ * u32 fields are stored as Long; i32 fields stay Int.
  */
 data class ConnectionInfo(
-    /** u32 — connection identifier, stored as Long. */
     val connId: Long,
-    /** i32 — current congestion window. */
     val window: Int,
-    /** i32 — packets currently in-flight. */
     val inFlight: Int,
-    /** u32 — round-trip time in milliseconds, stored as Long. */
     val rttMs: Long,
-    /** u32 — cumulative NAK count, stored as Long. */
     val nakCount: Long,
-    /** u32 — current bitrate in bytes per second, stored as Long. */
     val bitrateBytesSec: Long,
 )
 
-// ── Packet type extraction ────────────────────────────────────────────────────
-
 /**
- * Read the 2-byte big-endian packet type from [buf].
- * Returns null if [buf] has fewer than 2 bytes.
- * Mirrors Rust `get_packet_type` in src/protocol/types.rs.
- *
- * The result is always in [0, 0xFFFF] — Int is safe as an unsigned-16 carrier.
+ * TSBPD latency declared in an SRT handshake's HSREQ/HSRSP extension block.
+ * Both halves are milliseconds, each null when the peer did not set the
+ * matching TSBPD flag (the 16 bits are then meaningless, not zero).
  */
-fun getPacketType(buf: ByteArray): Int? {
-    if (buf.size < 2) return null
+data class SrtHandshakeLatency(
+    /** True for SRT_CMD_HSRSP (negotiated answer), false for HSREQ (proposal). */
+    val isResponse: Boolean,
+    /** Receive delay of the block's sender: the deadline routed packets must beat. */
+    val rcvMs: Int?,
+    /** Delay the block's sender expects its own peer to receive with. */
+    val sndMs: Int?,
+)
+
+/** 2-byte big-endian packet type, or null for a buffer shorter than 2 bytes. */
+fun getPacketType(buf: ByteArray, len: Int = buf.size): Int? {
+    if (len < 2) return null
     return ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
 }
 
-// ── Sequence number extraction ────────────────────────────────────────────────
-
 /**
- * Read SRT data-packet sequence number from the first 4 bytes of [buf].
- * Returns null if the buffer is shorter than 4 bytes, or if the MSB (control
- * bit) is set (indicating a control packet, not a data packet).
- * Mirrors Rust `get_srt_sequence_number` in src/protocol/types.rs.
- *
- * The returned value is a Long holding the unsigned 31-bit sequence number
- * (0 .. 0x7FFF_FFFF).
+ * SRT data-packet sequence number from the first 4 bytes, or null when the
+ * buffer is too short or the MSB (control bit) is set. The result is the
+ * non-negative 31-bit sequence.
  */
-fun getSrtSequenceNumber(buf: ByteArray): Long? {
-    if (buf.size < 4) return null
-    val sn = ((buf[0].toInt() and 0xFF) shl 24) or
-              ((buf[1].toInt() and 0xFF) shl 16) or
-              ((buf[2].toInt() and 0xFF) shl 8)  or
-               (buf[3].toInt() and 0xFF)
-    // Bit 31 set → control packet → return null (mirrors Rust `& 0x8000_0000 == 0`)
-    return if ((sn and -0x80000000) == 0) sn.toLong() else null
+fun getSrtSequenceNumber(buf: ByteArray, len: Int = buf.size): Int? {
+    if (len < 4) return null
+    val sn = readI32BE(buf, 0)
+    return if (sn and Int.MIN_VALUE == 0) sn else null
 }
 
-// ── Packet-type validator helpers ─────────────────────────────────────────────
-// Mirror Rust helper functions in src/protocol/types.rs
+/**
+ * Whether [buf] is an SRT data packet flagged as a retransmission.
+ *
+ * The second header word of a data packet is `PP(2)|O(1)|KK(2)|R(1)|msgno(26)`;
+ * the R bit (0x04 in byte 4) marks a packet the SRT sender re-sends after a NAK.
+ * Retransmits fill an existing hole in the receiver buffer, so one that rides a
+ * slow path arrives too late to matter.
+ */
+fun isSrtDataRetransmit(buf: ByteArray, len: Int = buf.size): Boolean =
+    len >= 8 && (buf[0].toInt() and 0x80) == 0 && (buf[4].toInt() and 0x04) != 0
 
-/** Returns true iff [buf] is a valid SRTLA REG1 packet. */
+/**
+ * Set the R bit on an SRT data packet in place, marking it a retransmission.
+ *
+ * Used for the duplicate probes sent on links held out of the payload rotation.
+ * The receiver dedups them by sequence either way, but a non-retransmit feeds an
+ * SRTLA-patched receiver's reorder-hold estimator; a probe from a slow link would
+ * pin that hold near its ceiling and slow loss recovery on the healthy links.
+ * Safe on encrypted packets: the receiver excludes this bit from the AES-GCM tag.
+ * No-op on anything that is not an SRT data packet.
+ */
+fun setSrtDataRetransmit(buf: ByteArray, len: Int = buf.size) {
+    if (len >= 8 && (buf[0].toInt() and 0x80) == 0) {
+        buf[4] = (buf[4].toInt() or 0x04).toByte()
+    }
+}
+
 fun isSrtlaReg1(buf: ByteArray): Boolean =
     buf.size == SRTLA_TYPE_REG1_LEN && getPacketType(buf) == SRTLA_TYPE_REG1
 
-/** Returns true iff [buf] is a valid SRTLA REG2 packet. */
 fun isSrtlaReg2(buf: ByteArray): Boolean =
     buf.size == SRTLA_TYPE_REG2_LEN && getPacketType(buf) == SRTLA_TYPE_REG2
 
-/** Returns true iff [buf] is a valid SRTLA REG3 packet. */
 fun isSrtlaReg3(buf: ByteArray): Boolean =
     buf.size == SRTLA_TYPE_REG3_LEN && getPacketType(buf) == SRTLA_TYPE_REG3
 
-/** Returns true iff [buf] starts with the SRTLA KEEPALIVE type. */
-fun isSrtlaKeepalive(buf: ByteArray): Boolean =
-    getPacketType(buf) == SRTLA_TYPE_KEEPALIVE
+fun isSrtlaKeepalive(buf: ByteArray): Boolean = getPacketType(buf) == SRTLA_TYPE_KEEPALIVE
 
-/** Returns true iff [buf] starts with the SRT ACK type. */
-fun isSrtAck(buf: ByteArray): Boolean =
-    getPacketType(buf) == SRT_TYPE_ACK
+fun isSrtAck(buf: ByteArray): Boolean = getPacketType(buf) == SRT_TYPE_ACK

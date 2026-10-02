@@ -2,14 +2,15 @@
 
 ## Primary Attribution
 
-This project is a Kotlin/JVM port of **irlserver/srtla_send v3.0.0**
-(commit `80cd0c4`), originally written in Rust by Thomas Lekanger.
+This project is a Kotlin/JVM port of **irlserver/srtla_send v4.1.0**
+(commit `5f2e081`), originally written in Rust by Thomas Lekanger.
 
 - Source: https://github.com/irlserver/srtla_send
 - License: MIT (see root `LICENSE` file)
 - Copyright (c) 2025 Thomas Lekanger
 
-The port was made by **Abdulkadir Özyurt** (2025–2026).
+The port was originally made from v3.0.0 (commit `80cd0c4`) by **Abdulkadir Özyurt** 
+and has been re-synced to v4.1.0 (2025–2026).
 All ported code is released under the same MIT license.
 
 ## Protocol Attribution
@@ -25,9 +26,9 @@ keepalive timing, connection group semantics) was designed and published by
 
 ## Additional Inspiration
 
-Scheduling algorithm ideas (quality scoring, BLEST, IoDS, EDPF pipeline)
-were inspired by **Moblin** (https://github.com/eerimoq/moblin), released
-under the MIT License.
+Scheduling algorithm ideas (quality scoring, NAK decay, weak-link classification,
+link congestion control, sole-carrier stickiness) were inspired by 
+**Moblin** (https://github.com/eerimoq/moblin), released under the MIT License.
 
 ## No Additional Dependencies
 
@@ -41,12 +42,15 @@ Files ported (under `src/main/kotlin/dev/abdulkadirozyurt/srtla/`):
 
 | Kotlin module | Rust source(s) |
 |---|---|
-| `protocol/` | `src/protocol/{constants,types,parsers,builders}.rs` |
-| `connection/` | `src/connection/{mod,ack_nak,socket,batch_send,batch_recv}.rs` |
-| `filter/` | `src/{ewma,kalman}.rs` |
-| `registration/` | `src/registration/{mod,probing}.rs` |
-| `sender/` | `src/sender/{mod,packet_handler,housekeeping,status,sequence}.rs` |
-| `sender/selection/` | `src/sender/selection/{mod,classic,enhanced,rtt_threshold,quality,exploration,blest,iods,edpf}.rs` |
-| `config/` | `src/config.rs` |
-| `stats/` | `src/stats.rs` |
-| `cli/` | `src/main.rs` |
+| `protocol/` | `crates/srtla-protocol/src/*` |
+| `core/` | `crates/srtla-core/src/{utils,seq,mode,config_snapshot,priority}.rs` |
+| `filter/` | `crates/srtla-core/src/{ewma,kalman}.rs` |
+| `connection/` | `crates/srtla-core/src/connection/*` |
+| `registration/` | `crates/srtla-core/src/registration/*` |
+| `selection/` | `crates/srtla-core/src/selection/*` |
+| `net/` | `src/net/*`, `src/priority_listener.rs` |
+| `sender/` | `src/sender/*` |
+| `config/` | `src/{config,control,control_socket,toml_config}.rs` |
+| `telemetry/` | `src/{stats,metrics,subscriptions}.rs` |
+| `json/` | Mini JSON serializer (replaces `serde_json` crate) |
+| `cli/` | `src/{main,version}.rs` |

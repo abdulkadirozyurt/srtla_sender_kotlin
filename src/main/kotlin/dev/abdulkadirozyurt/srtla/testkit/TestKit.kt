@@ -40,6 +40,18 @@ fun assertEquals(expected: Any?, actual: Any?, message: String? = null) {
     }
 }
 
+// Typed overloads: an integer literal next to a Long (or Double) value is
+// converted to that type instead of being boxed as Int, which would make
+// assertEquals(someLong, 1) compare Long(1) with Integer(1) and always fail.
+fun assertEquals(expected: Long, actual: Long, message: String? = null) =
+    assertEquals(expected as Any?, actual as Any?, message)
+
+fun assertEquals(expected: Int, actual: Int, message: String? = null) =
+    assertEquals(expected as Any?, actual as Any?, message)
+
+fun assertEquals(expected: Double, actual: Double, message: String? = null) =
+    assertEquals(expected as Any?, actual as Any?, message)
+
 fun assertNotEquals(unexpected: Any?, actual: Any?, message: String? = null) {
     if (unexpected == actual) {
         val msg = message ?: "expected values to differ but both were=<$actual>"
@@ -123,9 +135,11 @@ private fun bold(s: String)  = if (isTty) "[1m$s[0m"  else s
 
 data class TestResult(val suite: String, val test: String, val error: Throwable?)
 
-fun runAllSuites(): List<TestResult> {
+/** Run every registered suite, or only those whose name contains [filter]. */
+fun runAllSuites(filter: String? = null): List<TestResult> {
     val results = mutableListOf<TestResult>()
     for (s in allSuites) {
+        if (filter != null && !s.name.contains(filter, ignoreCase = true)) continue
         for (tc in s.cases) {
             val err = try { tc.body(); null } catch (e: Throwable) { e }
             results += TestResult(s.name, tc.name, err)
@@ -151,4 +165,11 @@ fun printSummary(results: List<TestResult>): Boolean {
     val summary = "$total tests: ${passed} passed, ${failed} failed"
     println(if (failed == 0) bold(green(summary)) else bold(red(summary)))
     return failed == 0
+}
+
+/** Assert two doubles are within [eps] of each other. */
+fun assertClose(expected: Double, actual: Double, eps: Double = 1e-9, message: String? = null) {
+    if (Math.abs(expected - actual) > eps || expected.isNaN() != actual.isNaN()) {
+        throw AssertionError(message ?: "expected=<$expected> but was=<$actual> (eps=$eps)")
+    }
 }

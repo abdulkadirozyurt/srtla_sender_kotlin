@@ -1,66 +1,49 @@
-// Ported from irlserver/srtla_send v3.0.0 (MIT)
-// Source: src/connection/bitrate.rs
+// Ported from irlserver/srtla_send v4.1.0 (MIT)
+// Source: crates/srtla-core/src/connection/bitrate.rs
 //
-// Bitrate measurement over a 2-second sliding window.
-// Matches Android C implementation.
+// Sans-IO leaf: every method that needs time takes it as `nowMs`, so the
+// caller owns the single monotonic clock.
 package dev.abdulkadirozyurt.srtla.connection
 
-// src/connection/bitrate.rs
+import dev.abdulkadirozyurt.srtla.core.satAdd
+import dev.abdulkadirozyurt.srtla.core.satMul
+import dev.abdulkadirozyurt.srtla.core.satSub
+
 private const val BITRATE_UPDATE_INTERVAL_MS: Long = 2_000L
 
-/**
- * Bitrate measurement and tracking.
- * Mirrors Rust `struct BitrateTracker` in src/connection/bitrate.rs.
- */
-class BitrateTracker {
+/** Bitrate measurement over a 2-second window. */
+class BitrateTracker(nowMs: Long) {
     var bytesSentTotal: Long = 0L
     var bytesSentWindow: Long = 0L
-    var lastRateUpdateMs: Long = System.currentTimeMillis()
+    var lastRateUpdateMs: Long = nowMs
+    /** Measured send rate in bits per second. */
     var currentBitrateBps: Double = 0.0
 
-    /** Reset all bitrate tracking state. */
-    fun reset() {
+    /** Start a fresh measurement window at [nowMs]. */
+    fun reset(nowMs: Long) {
         bytesSentTotal = 0L
         bytesSentWindow = 0L
-        lastRateUpdateMs = System.currentTimeMillis()
+        lastRateUpdateMs = nowMs
         currentBitrateBps = 0.0
     }
 
-    /** Update tracking when bytes are sent. */
     fun updateOnSend(bytesSent: Long) {
-        bytesSentTotal = bytesSentTotal.saturatingAdd(bytesSent)
+        bytesSentTotal = bytesSentTotal.satAdd(bytesSent)
     }
 
-    /**
-     * Calculate current bitrate over a 2-second window.
-     * Mirrors Rust `BitrateTracker::calculate`.
-     */
-    fun calculate() {
-        val now = System.currentTimeMillis()
-        val timeDiffMs = (now - lastRateUpdateMs).coerceAtLeast(0L)
+    /** Recompute the rate once the 2-second window has elapsed. */
+    fun calculate(nowMs: Long) {
+        val timeDiffMs = nowMs.satSub(lastRateUpdateMs)
         if (timeDiffMs >= BITRATE_UPDATE_INTERVAL_MS) {
-            val bytesDiff = (bytesSentTotal - bytesSentWindow).coerceAtLeast(0L)
+            val bytesDiff = bytesSentTotal.satSub(bytesSentWindow)
             if (timeDiffMs > 0L) {
-                // Convert to bits per second: (bytes * 8 * 1000) / milliseconds
-                val bits = bytesDiff.saturatingMul(8L)
+                val bits = bytesDiff.satMul(8L)
                 currentBitrateBps = (bits.toDouble() * 1000.0) / timeDiffMs.toDouble()
             }
-            lastRateUpdateMs = now
+            lastRateUpdateMs = nowMs
             bytesSentWindow = bytesSentTotal
         }
     }
 
-    /** Current bitrate in Mbps. */
     fun mbps(): Double = currentBitrateBps / 1_000_000.0
-}
-
-private fun Long.saturatingAdd(other: Long): Long {
-    val result = this + other
-    return if ((this xor other) < 0L || (this xor result) >= 0L) result else Long.MAX_VALUE
-}
-
-private fun Long.saturatingMul(other: Long): Long {
-    if (other == 0L) return 0L
-    val result = this * other
-    return if (this == result / other) result else Long.MAX_VALUE
 }
