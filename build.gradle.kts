@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "dev.abdulkadirozyurt"
-version = "4.1.0-kotlin.1-SNAPSHOT"
+version = "2.0.0"
 
 // JVM 11 hedefi; toolchain zorunluluğu yok — JDK 11+ olan her makinede derlenir.
 java {

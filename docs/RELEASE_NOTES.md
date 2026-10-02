@@ -1,4 +1,4 @@
-# srtla-sender-kotlin — sync with upstream srtla_send v4.1.0
+# srtla-sender-kotlin v2.0.0 — sync with upstream srtla_send v4.1.0
 
 This release re-syncs the Kotlin/JVM port with [irlserver/srtla_send](https://github.com/irlserver/srtla_send) **v4.1.0** (`5f2e081`).
 The previous Kotlin release was based on v3.0.0 (`80cd0c4`), so it covers 169 upstream commits.
