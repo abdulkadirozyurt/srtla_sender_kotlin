@@ -326,6 +326,35 @@ fun registerRegistrationTests() {
             assertTrue(reg.isProbing(), "driver is now awaiting probe responses")
         }
 
+        test("multi_uplink_waits_for_probes_before_reg1") {
+            val reg = RegistrationManager()
+            val connections = mutableListOf(createTestConnection(), createTestConnection())
+            val now = nowMs()
+
+            reg.startProbing(connections, now)
+            val sends = reg.regDriverPendingSends(connections.size, now)
+
+            assertNull(sends.reg1, "no REG1 until probing completes")
+            assertTrue(reg.isProbing())
+        }
+
+        test("single_uplink_skips_probing_and_sends_reg1_now") {
+            val reg = RegistrationManager()
+            val connections = mutableListOf(createTestConnection())
+            val now = nowMs()
+
+            val probes = reg.startProbing(connections, now)
+
+            assertTrue(probes.isEmpty(), "no RTT probes for a single uplink")
+            assertFalse(reg.isProbing(), "probing is complete immediately")
+            assertEquals(0, reg.reg1TargetIdx)
+
+            val sends = reg.regDriverPendingSends(connections.size, now)
+            assertNotNull(sends.reg1, "REG1 goes out on the same pass")
+            assertEquals(0, sends.reg1?.first)
+            assertEquals(STARTUP_GRACE_MS, connections[0].reconnection.startupGraceDeadlineMs - now)
+        }
+
         test("probing_skipped_when_active_connections") {
             val reg = RegistrationManager()
             val connections = mutableListOf(createTestConnection())

@@ -11,6 +11,7 @@
 // anything else is counted and reported as "not a registration packet".
 package dev.abdulkadirozyurt.srtla.registration
 
+import dev.abdulkadirozyurt.srtla.connection.STARTUP_GRACE_MS
 import dev.abdulkadirozyurt.srtla.connection.SrtlaConnection
 import dev.abdulkadirozyurt.srtla.core.nowMs
 import dev.abdulkadirozyurt.srtla.core.satSub
@@ -343,6 +344,17 @@ class RegistrationManager {
      */
     fun startProbing(connections: List<SrtlaConnection>, now: Long): List<Pair<Int, ByteArray>> {
         if (probingState != ProbingState.NOT_STARTED || activeConnections > 0) return emptyList()
+        if (connections.size <= 1) {
+            // Nothing to choose between: REG1 goes to the only uplink on the next driver pass.
+            log.info("single uplink: skipping RTT probing")
+            probingState = ProbingState.COMPLETE
+            reg1TargetIdx = 0
+            reg1NextSendAtMs = now
+            pendingTimeoutAtMs = 0L
+            // Same startup grace the probing-complete path gives the selected link.
+            connections.firstOrNull()?.let { it.reconnection.startupGraceDeadlineMs = now + STARTUP_GRACE_MS }
+            return emptyList()
+        }
         log.info("Starting RTT probing for ${connections.size} connections")
         probingState = ProbingState.PROBING
         probeResults.clear()

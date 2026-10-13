@@ -74,6 +74,15 @@ class SrtlaSender(
     @Volatile var started: Boolean = false
         private set
 
+    /**
+     * Uplinks currently registered (REG3 accepted, not reset). Refreshed after
+     * every uplink datagram and every housekeeping pass, so it is current without
+     * waiting for the 1 s stats tick. Written only by the event-loop thread; safe
+     * to read from any thread.
+     */
+    @Volatile var registeredLinks: Int = 0
+        private set
+
     /** Owned by the event-loop thread; never touch it from another thread while running. */
     val state: SenderState = SenderState(rehome = RehomeGate(config.rehomeOnFailure()))
 
@@ -189,6 +198,7 @@ class SrtlaSender(
         } catch (e: AllLinksFailedException) {
             log.warning("initial housekeeping failed: ${e.message}")
         }
+        refreshRegisteredLinks()
         started = true
 
         var nextHousekeeping = nowMs() + HOUSEKEEPING_INTERVAL_MS
@@ -282,7 +292,12 @@ class SrtlaSender(
                 return
             }
             handleUplinkPacket(state, connId, recvArr, recvBuf.position(), clientSink, config.snapshot(), config, nowMs())
+            refreshRegisteredLinks()
         }
+    }
+
+    private fun refreshRegisteredLinks() {
+        registeredLinks = state.connections.count { it.connected }
     }
 
     private fun sendToClient(data: ByteArray, len: Int, addr: SocketAddress) {
@@ -332,6 +347,7 @@ class SrtlaSender(
             // Upstream logs and keeps running; the stream may still come back.
             log.warning("housekeeping failed: ${e.message}")
         }
+        refreshRegisteredLinks()
 
         // Weak-link classifier and per-link CC; stamp results for selection.
         val snap = config.snapshot()
