@@ -34,7 +34,7 @@ fun handleHousekeeping(
 ) {
     val connections = state.connections
     val reg = state.reg
-    reg.clearPendingIfTimedOut(nowMs)
+    expireReg2Wait(state, nowMs, readers)
 
     if (reg.isProbing()) {
         reg.checkProbingComplete(nowMs)
@@ -78,6 +78,8 @@ fun handleHousekeeping(
                         sendOn(state, conn, reg.buildReg1For(i, nowMs), nowMs, "REG1", i)
                     }
                     pending != null -> log.fine { "${conn.label} timed out but another uplink is awaiting REG2; deferring" }
+                    // Initial-registration target: the driver re-sends its REG1 this pass.
+                    reg.reg1TargetIdx == i -> log.fine { "${conn.label} timed out; REG1 retry comes from the driver" }
                     else -> {
                         log.info("${conn.label} marked for recovery; re-sending REG2")
                         sendOn(state, conn, reg.buildReg2(i), nowMs, "REG2", i)
@@ -99,22 +101,7 @@ fun handleHousekeeping(
 
     reg.updateActiveConnections(connections)
 
-    val sends = reg.regDriverPendingSends(connections.size, nowMs)
-    sends.reg1?.let { (idx, pkt) ->
-        val conn = connections.getOrNull(idx)
-        if (conn != null) sendOn(state, conn, pkt, nowMs, "REG1", idx)
-    }
-    sends.broadcastReg2?.let { pkt ->
-        for ((i, conn) in connections.withIndex()) {
-            val io = state.connIo[conn.connId] ?: continue
-            try {
-                io.socket.send(pkt)
-                conn.noteSent(nowMs)
-                log.fine { "REG2 → uplink #$i sent" }
-            } catch (_: IOException) {
-            }
-        }
-    }
+    sendRegistration(state, nowMs)
 
     val active = connections.count { !it.isTimedOut(nowMs) }
     if (active == 0) {
@@ -140,6 +127,55 @@ fun handleHousekeeping(
         }
     } else {
         state.allFailedAt = null
+    }
+}
+
+/**
+ * Event-loop wake at a registration deadline: expire the REG2 wait and send the
+ * next REG1 now, without waiting for the 1 s housekeeping tick.
+ */
+fun handleRegistrationWake(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
+    expireReg2Wait(state, nowMs, readers)
+    sendRegistration(state, nowMs)
+}
+
+/**
+ * On a REG2 wait expiry during initial registration, rebind the target uplink to
+ * a fresh socket (new source port) so the next REG1 leaves on a new flow.
+ */
+private fun expireReg2Wait(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
+    val reg = state.reg
+    val idx = reg.clearPendingIfTimedOut(nowMs) ?: return
+    if (reg.activeConnections != 0) return
+    val conn = state.connections.getOrNull(idx) ?: return
+    val io = state.connIo[conn.connId] ?: return
+    log.info("REG1 retry #${reg.reg1Attempts + 1} on fresh socket (wait ${reg.nextReg2WaitMs()}ms)")
+    try {
+        rebuildUplinkSocket(conn, io, state.seqTracker, nowMs)
+        readers.restartReaderFor(conn, io)
+    } catch (e: IOException) {
+        log.warning("${conn.label} fresh socket for REG1 retry failed: ${e.message}")
+    }
+}
+
+/** Send this pass's registration packets: REG1 to the target, REG2 broadcast. */
+private fun sendRegistration(state: SenderState, nowMs: Long) {
+    val connections = state.connections
+    val sends = state.reg.regDriverPendingSends(connections.size, nowMs)
+    sends.reg1?.let { (idx, pkt) ->
+        val conn = connections.getOrNull(idx)
+        if (conn != null) sendOn(state, conn, pkt, nowMs, "REG1", idx)
+    }
+    sends.broadcastReg2?.let { pkt ->
+        for ((i, conn) in connections.withIndex()) {
+            val io = state.connIo[conn.connId] ?: continue
+            try {
+                io.socket.send(pkt)
+                conn.noteSent(nowMs)
+                log.fine { "REG2 → uplink #$i sent" }
+            } catch (_: IOException) {
+            }
+        }
     }
 }
 

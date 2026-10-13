@@ -62,6 +62,10 @@ class RegistrationManager {
     var reg1NextSendAtMs: Long = 0L
         internal set
 
+    /** REG1s sent in the current initial-registration run; drives the REG2 wait escalation. */
+    var reg1Attempts: Int = 0
+        private set
+
     private var probingState = ProbingState.NOT_STARTED
     private var probeId: ByteArray = randomId()
     private val probeResults = ArrayList<ProbeResult>(4)
@@ -100,6 +104,7 @@ class RegistrationManager {
         broadcastReg2Pending = false
         reg1TargetIdx = null
         reg1NextSendAtMs = 0L
+        reg1Attempts = 0
         awaitingReg3.clear()
         connectedSnapshot.clear()
         probingState = ProbingState.NOT_STARTED
@@ -122,13 +127,33 @@ class RegistrationManager {
 
     private fun isConnectedSnapshot(connIdx: Int): Boolean = connectedSnapshot.getOrNull(connIdx) ?: false
 
+    /**
+     * REG2 wait for the next REG1. Initial registration (no link up) escalates
+     * 1 s, 2 s, then 4 s; re-registration keeps REG2_TIMEOUT.
+     */
+    private fun reg2WaitMs(attempt: Int): Long = when {
+        activeConnections != 0 -> REG2_TIMEOUT * 1000L
+        attempt <= 1 -> 1000L
+        attempt == 2 -> 2000L
+        else -> REG2_TIMEOUT * 1000L
+    }
+
+    /** REG2 wait the upcoming REG1 will get (for logs). */
+    fun nextReg2WaitMs(): Long = reg2WaitMs(reg1Attempts + 1)
+
+    /** Count a REG1 and return its REG2 wait. */
+    private fun armReg1Wait(): Long {
+        reg1Attempts++
+        return reg2WaitMs(reg1Attempts)
+    }
+
     /** Build a REG1 for [connIdx] and move into "awaiting REG2". */
     fun buildReg1For(connIdx: Int, now: Long): ByteArray {
         val pkt = createReg1Packet(srtlaId)
         log.info("REG1 → uplink #$connIdx (${pkt.size} bytes)")
         pendingReg2Idx = connIdx
         reg1TargetIdx = connIdx
-        pendingTimeoutAtMs = now + REG2_TIMEOUT * 1000L
+        pendingTimeoutAtMs = now + armReg1Wait()
         reg1NextSendAtMs = now + 1000L
         return pkt
     }
@@ -189,7 +214,7 @@ class RegistrationManager {
                     val pkt = createReg1Packet(srtlaId)
                     log.info("REG1 → uplink #$idx (${pkt.size} bytes)")
                     pendingReg2Idx = idx
-                    pendingTimeoutAtMs = now + REG2_TIMEOUT * 1000L
+                    pendingTimeoutAtMs = now + armReg1Wait()
                     reg1NextSendAtMs = now + REG2_TIMEOUT * 1000L
                     reg1 = idx to pkt
                 } else if (pendingReg2Idx != null) {
@@ -237,6 +262,7 @@ class RegistrationManager {
         if (pendingReg2Idx == connIdx) {
             buf.copyInto(srtlaId, destinationOffset = 0, startIndex = 2, endIndex = 2 + SRTLA_ID_LEN)
             log.fine { "REG2 from uplink #$connIdx accepted; broadcasting to peers" }
+            reg1Attempts = 0
             pendingReg2Idx = null
             pendingTimeoutAtMs = nowMs + REG3_TIMEOUT * 1000L
             broadcastReg2Pending = true
@@ -253,6 +279,7 @@ class RegistrationManager {
             return false
         }
         revokeReg3Grant(connIdx)
+        reg1Attempts = 0
         hasConnected = true
         return true
     }
@@ -313,23 +340,36 @@ class RegistrationManager {
             }
         }
         activeConnections = newCount
+        if (newCount > 0) reg1Attempts = 0
         connectedSnapshot.clear()
         for (c in connections) connectedSnapshot.add(c.connected)
     }
 
     fun pendingReg2Idx(): Int? = pendingReg2Idx
 
+    /**
+     * Expire a REG2 wait; the next REG1 is due at once. During initial
+     * registration the target is kept, so the driver re-sends REG1 without
+     * waiting for a REG_NGP (that wait was the ~12 s gap).
+     */
     fun clearPendingIfTimedOut(nowMs: Long): Int? {
         val idx = pendingReg2Idx ?: return null
         if (pendingTimeoutAtMs != 0L && nowMs >= pendingTimeoutAtMs) {
-            log.warning("REG2 wait exceeded ${REG2_TIMEOUT * 1000}ms for uplink #$idx; clearing pending handshake")
+            log.warning("REG2 wait expired for uplink #$idx; clearing pending handshake")
             pendingReg2Idx = null
             pendingTimeoutAtMs = 0L
-            reg1TargetIdx = null
+            if (activeConnections != 0) reg1TargetIdx = null
             reg1NextSendAtMs = nowMs
             return idx
         }
         return null
+    }
+
+    /** Earliest instant the registration driver must run, or null when idle. */
+    fun nextWakeAtMs(): Long? = when {
+        pendingReg2Idx != null -> pendingTimeoutAtMs.takeIf { it != 0L }
+        activeConnections == 0 && reg1TargetIdx != null -> reg1NextSendAtMs
+        else -> null
     }
 
     fun getSelectedConnectionIdx(): Int? = reg1TargetIdx

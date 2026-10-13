@@ -206,7 +206,9 @@ class SrtlaSender(
         var statusElapsedMs = 0L
 
         while (running.get()) {
-            val wait = maxOf(minOf(nextHousekeeping, nextFlush) - nowMs(), 1L)
+            // Also wake at a registration deadline (REG2 expiry or next REG1 due).
+            val regWake = state.reg.nextWakeAtMs()
+            val wait = maxOf(minOf(nextHousekeeping, nextFlush, regWake ?: Long.MAX_VALUE) - nowMs(), 1L)
             sel.select(wait)
             val it = sel.selectedKeys().iterator()
             while (it.hasNext()) {
@@ -223,6 +225,7 @@ class SrtlaSender(
             if (reloadRequested.getAndSet(false)) queueIpReload()
 
             val now = nowMs()
+            state.reg.nextWakeAtMs()?.let { if (now >= it) handleRegistrationWake(state, now, readers) }
             if (now >= nextFlush) {
                 flushAllBatches(state, now)
                 nextFlush = now + BATCH_FLUSH_INTERVAL_MS

@@ -238,7 +238,7 @@ fun registerRegistrationTests() {
             assertEquals(0, cleared)
             assertNull(reg.pendingReg2Idx())
             assertEquals(0L, reg.pendingTimeoutAtMs)
-            assertNull(reg.reg1TargetIdx)
+            assertEquals(0, reg.reg1TargetIdx, "initial registration keeps the target for the next REG1")
             assertEquals(clearedTime, reg.reg1NextSendAtMs)
         }
 
@@ -551,20 +551,18 @@ fun registerRegistrationTests() {
             reg.buildReg1For(0, base)
             assertEquals(0, reg.pendingReg2Idx())
 
+            // Initial registration: first REG1 waits 1 s (escalation), not REG2_TIMEOUT.
             val deadline = reg.pendingTimeoutAtMs
-            assertTrue(
-                deadline >= base + REG2_TIMEOUT * 1000 && deadline <= nowMs() + REG2_TIMEOUT * 1000,
-                "REG2 deadline must be REG2_TIMEOUT (4s) past the REG1 send"
-            )
+            assertEquals(base + 1000L, deadline, "first REG1 REG2 deadline is 1 s past the send")
 
             assertNull(
                 reg.clearPendingIfTimedOut(deadline - 1),
-                "must not time out before REG2_TIMEOUT"
+                "must not time out before the wait"
             )
             assertEquals(
                 0,
                 reg.clearPendingIfTimedOut(deadline),
-                "REG2 wait must time out at REG2_TIMEOUT (4s)"
+                "REG2 wait must time out at its deadline"
             )
             assertNull(reg.pendingReg2Idx(), "timeout clears pending")
             assertEquals(
@@ -987,6 +985,83 @@ fun registerRegistrationTests() {
                 reg.hasConnected,
                 "has_connected records that this process has streamed before"
             )
+        }
+
+        test("initial_reg2_wait_escalates_1s_2s_4s") {
+            val reg = RegistrationManager()
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            assertEquals(base + 1000L, reg.pendingTimeoutAtMs, "first REG1 waits 1 s")
+            reg.clearPendingIfTimedOut(base + 1000L)
+
+            reg.buildReg1For(0, base + 1000L)
+            assertEquals(base + 3000L, reg.pendingTimeoutAtMs, "second REG1 waits 2 s")
+            reg.clearPendingIfTimedOut(base + 3000L)
+
+            reg.buildReg1For(0, base + 3000L)
+            assertEquals(base + 7000L, reg.pendingTimeoutAtMs, "later REG1s wait 4 s")
+        }
+
+        test("re_registration_keeps_4s_reg2_wait") {
+            val reg = RegistrationManager()
+            reg.updateActiveConnections(listOf(createTestConnection().also { it.connected = true }))
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            assertEquals(base + REG2_TIMEOUT * 1000L, reg.pendingTimeoutAtMs)
+        }
+
+        test("reg2_expiry_resends_reg1_immediately_with_target_kept") {
+            val reg = RegistrationManager()
+            val base = nowMs()
+            reg.buildReg1For(2, base)
+            assertEquals(base + 1000L, reg.pendingTimeoutAtMs)
+
+            assertEquals(2, reg.clearPendingIfTimedOut(base + 1000L))
+            assertEquals(2, reg.reg1TargetIdx, "initial registration keeps the target")
+            assertEquals(base + 1000L, reg.reg1NextSendAtMs, "next REG1 due at the expiry")
+
+            val sends = reg.regDriverPendingSends(3, base + 1000L)
+            assertNotNull(sends.reg1, "driver sends REG1 on the same pass, no REG_NGP needed")
+            assertEquals(2, sends.reg1!!.first)
+            assertEquals(base + 3000L, reg.pendingTimeoutAtMs, "second REG1 waits 2 s")
+        }
+
+        test("reg2_escalation_resets_after_reg2") {
+            val reg = RegistrationManager()
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            reg.clearPendingIfTimedOut(base + 1000L)
+            reg.buildReg1For(0, base + 1000L)
+            reg.clearPendingIfTimedOut(base + 3000L)
+            reg.buildReg1For(0, base + 3000L)
+            assertEquals(3, reg.reg1Attempts)
+
+            reg.processRegistrationPacket(0, createReg2Packet(reg.srtlaId), nowMs())
+            assertEquals(0, reg.reg1Attempts, "accepted REG2 resets the escalation")
+
+            reg.buildReg1For(0, base + 4000L)
+            assertEquals(base + 5000L, reg.pendingTimeoutAtMs, "after reset the next REG1 waits 1 s again")
+        }
+
+        test("reg2_escalation_resets_after_reg3") {
+            val reg = RegistrationManager()
+            reg.buildReg1For(0, nowMs())
+            reg.buildReg2(1)
+            assertEquals(1, reg.reg1Attempts)
+            reg.processRegistrationPacket(1, createReg3Packet(), nowMs())
+            assertEquals(0, reg.reg1Attempts, "accepted REG3 resets the escalation")
+        }
+
+        test("next_wake_tracks_reg2_expiry_and_next_reg1") {
+            val reg = RegistrationManager()
+            assertNull(reg.nextWakeAtMs(), "idle registration has no wake")
+
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            assertEquals(base + 1000L, reg.nextWakeAtMs(), "wake at the REG2 expiry")
+
+            reg.clearPendingIfTimedOut(base + 1000L)
+            assertEquals(base + 1000L, reg.nextWakeAtMs(), "wake now: the next REG1 is due")
         }
     }
 }
