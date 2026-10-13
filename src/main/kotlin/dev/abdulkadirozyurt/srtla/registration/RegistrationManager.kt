@@ -33,6 +33,19 @@ private val rng = SecureRandom()
 
 private fun randomId(): ByteArray = ByteArray(SRTLA_ID_LEN).also { rng.nextBytes(it) }
 
+/**
+ * Initial registration only: wait after REG2(conn) send n (1-based) for its REG3,
+ * then resend. The last wait is the REG3 timeout. Retries stay inside the
+ * server's 4 s group validity, and a late REG3 still lands in the last wait.
+ */
+private val REG2_CONN_WAITS_MS = longArrayOf(500L, 1000L, 2000L, REG3_TIMEOUT * 1000L)
+
+/** REG2(conn) sends per uplink before the registration restarts: initial send + 3 retries. */
+private const val REG2_CONN_MAX_SENDS = 4
+
+/** One uplink's REG2 awaiting REG3 during initial registration. */
+private class Reg3Retry(var sends: Int, var deadlineMs: Long)
+
 enum class RegistrationEvent { REG_NGP, REG2, REG3, REG_ERR }
 
 internal enum class ProbingState { NOT_STARTED, PROBING, WAITING_FOR_PROBES, COMPLETE }
@@ -45,6 +58,10 @@ class RegDriverSends(
     val reg1: Pair<Int, ByteArray>?,
     /** REG2 to broadcast to every uplink. */
     val broadcastReg2: ByteArray?,
+    /** Connection REG2 resends to single uplinks still awaiting REG3: (connIdx, packet). */
+    val reg2Retries: List<Pair<Int, ByteArray>> = emptyList(),
+    /** Registration restarted: rebind this uplink to a fresh socket before the next REG1. */
+    val restartUplink: Int? = null,
 )
 
 class RegistrationManager {
@@ -78,6 +95,9 @@ class RegistrationManager {
      */
     private val awaitingReg3 = ArrayList<Int>(4)
 
+    /** REG3 retry timers for the connection REG2s in flight (initial registration only). */
+    private val reg3Retries = HashMap<Int, Reg3Retry>()
+
     /** connected flags snapshotted by updateActiveConnections, same indexing. */
     private val connectedSnapshot = ArrayList<Boolean>(4)
 
@@ -96,8 +116,7 @@ class RegistrationManager {
      * hasConnected survives: it only drives log wording.
      */
     fun resetForRehome() {
-        val fresh = randomId()
-        fresh.copyInto(srtlaId, destinationOffset = SRTLA_ID_LEN / 2, startIndex = SRTLA_ID_LEN / 2)
+        rerandomizeReceiverHalf()
         pendingReg2Idx = null
         pendingTimeoutAtMs = 0L
         activeConnections = 0
@@ -106,6 +125,7 @@ class RegistrationManager {
         reg1NextSendAtMs = 0L
         reg1Attempts = 0
         awaitingReg3.clear()
+        reg3Retries.clear()
         connectedSnapshot.clear()
         probingState = ProbingState.NOT_STARTED
         probeId = randomId()
@@ -123,6 +143,13 @@ class RegistrationManager {
 
     private fun revokeReg3Grant(connIdx: Int) {
         awaitingReg3.removeAll { it == connIdx }
+        reg3Retries.remove(connIdx)
+    }
+
+    /** Re-randomize the receiver-issued half of the id; our half is kept (only it reaches a REG1). */
+    private fun rerandomizeReceiverHalf() {
+        val fresh = randomId()
+        fresh.copyInto(srtlaId, destinationOffset = SRTLA_ID_LEN / 2, startIndex = SRTLA_ID_LEN / 2)
     }
 
     private fun isConnectedSnapshot(connIdx: Int): Boolean = connectedSnapshot.getOrNull(connIdx) ?: false
@@ -206,17 +233,33 @@ class RegistrationManager {
     fun regDriverPendingSends(connectionCount: Int, now: Long): RegDriverSends {
         var reg1: Pair<Int, ByteArray>? = null
         var broadcast: ByteArray? = null
+        val reg2Retries = ArrayList<Pair<Int, ByteArray>>(0)
+
+        if (activeConnections == 0) {
+            val exhausted = pumpReg3Retries(now, reg2Retries)
+            if (exhausted != null) {
+                // Every REG2 send for this uplink went unanswered: start over on a fresh socket.
+                restartInitialRegistration(exhausted, now)
+                return RegDriverSends(null, null, emptyList(), exhausted)
+            }
+        }
 
         if (activeConnections == 0) {
             val idx = reg1TargetIdx
             if (idx != null) {
                 if (pendingReg2Idx == null && now >= reg1NextSendAtMs) {
-                    val pkt = createReg1Packet(srtlaId)
-                    log.info("REG1 → uplink #$idx (${pkt.size} bytes)")
-                    pendingReg2Idx = idx
-                    pendingTimeoutAtMs = now + armReg1Wait()
-                    reg1NextSendAtMs = now + REG2_TIMEOUT * 1000L
-                    reg1 = idx to pkt
+                    if (idx < connectionCount) {
+                        val pkt = createReg1Packet(srtlaId)
+                        log.info("REG1 → uplink #$idx (${pkt.size} bytes)")
+                        pendingReg2Idx = idx
+                        pendingTimeoutAtMs = now + armReg1Wait()
+                        reg1NextSendAtMs = now + REG2_TIMEOUT * 1000L
+                        reg1 = idx to pkt
+                    } else {
+                        // No such uplink: move the due time on so the wake does not repeat at once.
+                        log.warning("REG1 target uplink #$idx does not exist; retrying in 100 ms")
+                        reg1NextSendAtMs = now + 100L
+                    }
                 } else if (pendingReg2Idx != null) {
                     log.fine { "REG1 pending for uplink #$idx (timeout at $pendingTimeoutAtMs), skipping send" }
                 }
@@ -236,11 +279,52 @@ class RegistrationManager {
                     continue
                 }
                 armReg3Grant(idx)
+                if (activeConnections == 0) {
+                    reg3Retries[idx] = Reg3Retry(sends = 1, deadlineMs = now + REG2_CONN_WAITS_MS[0])
+                }
             }
             broadcast = pkt
             broadcastReg2Pending = false
         }
-        return RegDriverSends(reg1, broadcast)
+        return RegDriverSends(reg1, broadcast, reg2Retries)
+    }
+
+    /**
+     * Resend REG2 to each uplink whose REG3 wait has run out (initial registration).
+     * Appends the resends to [out]. Returns the first uplink that used up its
+     * sends, or null; the caller then restarts registration.
+     */
+    private fun pumpReg3Retries(now: Long, out: MutableList<Pair<Int, ByteArray>>): Int? {
+        val due = reg3Retries.filterValues { now >= it.deadlineMs }.keys.sorted()
+        for (idx in due) {
+            val retry = reg3Retries[idx] ?: continue
+            if (retry.sends >= REG2_CONN_MAX_SENDS) {
+                log.info("no REG3 after ${retry.sends} tries; restarting registration on fresh socket (uplink #$idx)")
+                return idx
+            }
+            retry.sends++
+            val wait = REG2_CONN_WAITS_MS[retry.sends - 1]
+            retry.deadlineMs = now + wait
+            log.info("REG2(conn) retry #${retry.sends - 1} for uplink #$idx (wait ${wait}ms)")
+            out.add(idx to createReg2Packet(srtlaId))
+        }
+        return null
+    }
+
+    /**
+     * Restart initial registration after a REG2(conn) gave up: drop every REG3
+     * grant and timer, reset the group id, and target [idx] for a fresh REG1.
+     * The REG1 goes out on a later pass, once the shell has rebound the socket.
+     */
+    private fun restartInitialRegistration(idx: Int, now: Long) {
+        reg3Retries.clear()
+        awaitingReg3.clear()
+        broadcastReg2Pending = false
+        pendingReg2Idx = null
+        pendingTimeoutAtMs = 0L
+        rerandomizeReceiverHalf()
+        reg1TargetIdx = idx
+        reg1NextSendAtMs = now
     }
 
     private fun handleRegNgp(connIdx: Int, nowMs: Long) {
@@ -340,7 +424,10 @@ class RegistrationManager {
             }
         }
         activeConnections = newCount
-        if (newCount > 0) reg1Attempts = 0
+        if (newCount > 0) {
+            reg1Attempts = 0
+            reg3Retries.clear()
+        }
         connectedSnapshot.clear()
         for (c in connections) connectedSnapshot.add(c.connected)
     }
@@ -366,10 +453,17 @@ class RegistrationManager {
     }
 
     /** Earliest instant the registration driver must run, or null when idle. */
-    fun nextWakeAtMs(): Long? = when {
-        pendingReg2Idx != null -> pendingTimeoutAtMs.takeIf { it != 0L }
-        activeConnections == 0 && reg1TargetIdx != null -> reg1NextSendAtMs
-        else -> null
+    fun nextWakeAtMs(): Long? {
+        val wakes = ArrayList<Long>(3)
+        if (pendingReg2Idx != null) {
+            pendingTimeoutAtMs.takeIf { it != 0L }?.let { wakes.add(it) }
+        } else if (activeConnections == 0 && reg1TargetIdx != null) {
+            wakes.add(reg1NextSendAtMs)
+        }
+        if (activeConnections == 0) {
+            reg3Retries.values.minOfOrNull { it.deadlineMs }?.let { wakes.add(it) }
+        }
+        return wakes.minOrNull()
     }
 
     fun getSelectedConnectionIdx(): Int? = reg1TargetIdx

@@ -101,7 +101,7 @@ fun handleHousekeeping(
 
     reg.updateActiveConnections(connections)
 
-    sendRegistration(state, nowMs)
+    sendRegistration(state, nowMs, readers)
 
     val active = connections.count { !it.isTimedOut(nowMs) }
     if (active == 0) {
@@ -136,7 +136,7 @@ fun handleHousekeeping(
  */
 fun handleRegistrationWake(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
     expireReg2Wait(state, nowMs, readers)
-    sendRegistration(state, nowMs)
+    sendRegistration(state, nowMs, readers)
 }
 
 /**
@@ -158,13 +158,33 @@ private fun expireReg2Wait(state: SenderState, nowMs: Long, readers: ReaderRegis
     }
 }
 
-/** Send this pass's registration packets: REG1 to the target, REG2 broadcast. */
-private fun sendRegistration(state: SenderState, nowMs: Long) {
+/**
+ * Send this pass's registration packets: REG1 to the target, REG2 broadcast, and
+ * REG2 resends to uplinks still awaiting REG3. A restarted registration rebinds
+ * the target uplink first; its fresh REG1 leaves on the next driver pass.
+ */
+private fun sendRegistration(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
     val connections = state.connections
     val sends = state.reg.regDriverPendingSends(connections.size, nowMs)
+    sends.restartUplink?.let { idx ->
+        val conn = connections.getOrNull(idx)
+        val io = conn?.let { state.connIo[it.connId] }
+        if (conn != null && io != null) {
+            try {
+                rebuildUplinkSocket(conn, io, state.seqTracker, nowMs)
+                readers.restartReaderFor(conn, io)
+            } catch (e: IOException) {
+                log.warning("${conn.label} fresh socket for registration restart failed: ${e.message}")
+            }
+        }
+    }
     sends.reg1?.let { (idx, pkt) ->
         val conn = connections.getOrNull(idx)
         if (conn != null) sendOn(state, conn, pkt, nowMs, "REG1", idx)
+    }
+    for ((idx, pkt) in sends.reg2Retries) {
+        val conn = connections.getOrNull(idx) ?: continue
+        sendOn(state, conn, pkt, nowMs, "REG2", idx)
     }
     sends.broadcastReg2?.let { pkt ->
         for ((i, conn) in connections.withIndex()) {

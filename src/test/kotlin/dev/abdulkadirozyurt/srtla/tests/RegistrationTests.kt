@@ -1063,6 +1063,106 @@ fun registerRegistrationTests() {
             reg.clearPendingIfTimedOut(base + 1000L)
             assertEquals(base + 1000L, reg.nextWakeAtMs(), "wake now: the next REG1 is due")
         }
+
+        test("reg3_retry_escalates_then_restarts_on_fresh_reg1") {
+            val reg = RegistrationManager()
+            val connections = createTestConnections(2)
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            reg.processRegistrationPacket(0, createReg2Packet(ByteArray(SRTLA_ID_LEN)), base)
+            reg.regDriverPendingSends(connections.size, base)
+            assertEquals(base + 500L, reg.nextWakeAtMs(), "first REG2 resend 500 ms after the broadcast")
+
+            // Resends at 0.5 s, 1.5 s and 3.5 s; each waits 1 s, 2 s, then REG3_TIMEOUT.
+            val retryAt = listOf(500L, 1500L, 3500L)
+            val nextWakeAt = listOf(1500L, 3500L, 7500L)
+            for (n in retryAt.indices) {
+                val sends = reg.regDriverPendingSends(connections.size, base + retryAt[n])
+                assertEquals(listOf(0, 1), sends.reg2Retries.map { it.first }, "REG2 resent to both uplinks, retry #${n + 1}")
+                assertNull(sends.restartUplink)
+                assertEquals(base + nextWakeAt[n], reg.nextWakeAtMs(), "retry #${n + 1} arms the next wait")
+            }
+
+            val fallback = reg.regDriverPendingSends(connections.size, base + 7500L)
+            assertEquals(0, fallback.restartUplink, "no REG3 after the cap: restart on uplink #0")
+            assertTrue(fallback.reg2Retries.isEmpty(), "no REG2 resend on the restart pass")
+            assertNull(fallback.reg1, "fresh REG1 waits for the socket rebind")
+            assertEquals(base + 7500L, reg.nextWakeAtMs(), "fresh REG1 due now")
+
+            val reg1 = reg.regDriverPendingSends(connections.size, base + 7500L)
+            assertEquals(0, reg1.reg1?.first, "fresh REG1 goes to the same uplink")
+            assertTrue((reg.nextWakeAtMs() ?: 0L) > base + 7500L, "REG1 wait now runs")
+        }
+
+        test("reg3_retry_stops_for_uplink_whose_reg3_arrives") {
+            val reg = RegistrationManager()
+            val connections = createTestConnections(2)
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            reg.processRegistrationPacket(0, createReg2Packet(ByteArray(SRTLA_ID_LEN)), base)
+            reg.regDriverPendingSends(connections.size, base)
+
+            assertEquals(RegistrationEvent.REG3, reg.processRegistrationPacket(1, createReg3Packet(), base + 100))
+            val sends = reg.regDriverPendingSends(connections.size, base + 500L)
+            assertEquals(listOf(0), sends.reg2Retries.map { it.first }, "only the uplink still awaiting REG3 is resent")
+        }
+
+        test("reg3_escalation_resets_when_link_comes_up") {
+            val reg = RegistrationManager()
+            val connections = createTestConnections(2)
+            val base = nowMs()
+            reg.buildReg1For(0, base)
+            reg.processRegistrationPacket(0, createReg2Packet(ByteArray(SRTLA_ID_LEN)), base)
+            reg.regDriverPendingSends(connections.size, base)
+            reg.regDriverPendingSends(connections.size, base + 500L)
+
+            assertEquals(RegistrationEvent.REG3, reg.processRegistrationPacket(0, createReg3Packet(), base + 600L))
+            reg.updateActiveConnections(listOf(createTestConnection().also { it.connected = true }))
+            assertNull(reg.nextWakeAtMs(), "a link is up: no REG3 retry timers remain")
+            assertEquals(0, reg.reg1Attempts)
+            val later = reg.regDriverPendingSends(connections.size, base + 1500L)
+            assertTrue(later.reg2Retries.isEmpty(), "no REG2 resends once registered")
+        }
+
+        test("registration_wakes_never_spin_on_a_due_deadline") {
+            // A REG1 target with no uplink behind it must not keep the wake due.
+            val stale = RegistrationManager()
+            val base = nowMs()
+            stale.setReg1TargetIdx(5)
+            stale.setReg1NextSendAtMs(base)
+            driveDuePasses(stale, 1, base)
+            assertTrue((stale.nextWakeAtMs() ?: 0L) > base, "missing target moves the REG1 due time on")
+
+            // REG2 never answered: every wake the timeline offers must be progressed by a pass.
+            val reg = RegistrationManager()
+            val t0 = base + 10_000L
+            reg.buildReg1For(0, t0)
+            reg.processRegistrationPacket(0, createReg2Packet(ByteArray(SRTLA_ID_LEN)), t0)
+            reg.regDriverPendingSends(2, t0)
+            var t = t0
+            repeat(12) {
+                val wake = reg.nextWakeAtMs() ?: return@repeat
+                t = maxOf(t, wake)
+                driveDuePasses(reg, 2, t)
+            }
+        }
+    }
+}
+
+/**
+ * Mirror of the shell loop at one instant: expire the REG2 wait, then run driver
+ * passes while a wake is due. Every pass must move the wake past [now] or clear it;
+ * a pass that leaves the same due wake behind is a busy loop.
+ */
+private fun driveDuePasses(reg: RegistrationManager, connectionCount: Int, now: Long, maxPasses: Int = 4) {
+    reg.clearPendingIfTimedOut(now)
+    var passes = 0
+    while (true) {
+        val wake = reg.nextWakeAtMs() ?: return
+        if (wake > now) return
+        check(passes < maxPasses) { "wake stuck at $wake with now=$now (busy loop)" }
+        reg.regDriverPendingSends(connectionCount, now)
+        passes++
     }
 }
 
