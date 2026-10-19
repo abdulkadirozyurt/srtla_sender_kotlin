@@ -3,9 +3,11 @@
 package dev.abdulkadirozyurt.srtla.tests
 
 import dev.abdulkadirozyurt.srtla.core.nowMs
+import dev.abdulkadirozyurt.srtla.registration.RegistrationEvent
 import dev.abdulkadirozyurt.srtla.registration.RegistrationManager
 import dev.abdulkadirozyurt.srtla.sender.AllLinksFailedException
 import dev.abdulkadirozyurt.srtla.protocol.SRTLA_ID_LEN
+import dev.abdulkadirozyurt.srtla.protocol.SRTLA_TYPE_REG3
 import dev.abdulkadirozyurt.srtla.sender.ConnIoMap
 import dev.abdulkadirozyurt.srtla.sender.GLOBAL_TIMEOUT_MS
 import dev.abdulkadirozyurt.srtla.sender.NoopReaderRegistry
@@ -14,6 +16,7 @@ import dev.abdulkadirozyurt.srtla.sender.RehomeGate
 import dev.abdulkadirozyurt.srtla.sender.SenderState
 import dev.abdulkadirozyurt.srtla.sender.StubResolver
 import dev.abdulkadirozyurt.srtla.sender.handleHousekeeping
+import dev.abdulkadirozyurt.srtla.sender.registerAddedUplinks
 import dev.abdulkadirozyurt.srtla.sender.receiverMoved
 import dev.abdulkadirozyurt.srtla.sender.tryRehome
 import dev.abdulkadirozyurt.srtla.testkit.*
@@ -96,6 +99,35 @@ fun registerHousekeepingRehomeTests() {
                 fired,
                 "the all-failed timeout must fire once a full ${GLOBAL_TIMEOUT_MS}ms has elapsed since failure",
             )
+        }
+
+        test("an_uplink_added_mid_session_registers_at_once") {
+            val state = SenderState(reg = RegistrationManager())
+            // Group in place, every old link gone (the network switch case).
+            state.reg.hasConnected = true
+            val now = nowMs()
+            val added = createTestConnections(1, now)
+            state.connections.addAll(added)
+            state.connIo.putAll(createTestConnIoMap(added))
+
+            registerAddedUplinks(state, added, now)
+
+            assertEquals(0L, added[0].reconnection.startupGraceDeadlineMs, "no startup grace for a link joining a group")
+            // The REG2 went out now: the receiver's REG3 connects the link.
+            assertEquals(RegistrationEvent.REG3, state.reg.processRegistrationPacket(0, reg3Packet(), now))
+        }
+
+        test("an_uplink_added_before_the_first_registration_waits_for_the_driver") {
+            val state = SenderState(reg = RegistrationManager())
+            val now = nowMs()
+            val added = createTestConnections(1, now)
+            state.connections.addAll(added)
+            state.connIo.putAll(createTestConnIoMap(added))
+
+            registerAddedUplinks(state, added, now)
+
+            assertEquals(now, added[0].reconnection.startupGraceDeadlineMs, "initial registration keeps its grace")
+            assertNull(state.reg.processRegistrationPacket(0, reg3Packet(), now), "no REG2 was sent, so no REG3 is expected")
         }
 
         test("a_healthy_bond_is_never_re_homed_however_much_dns_drifts") {
@@ -591,3 +623,6 @@ private class RecordingReaderRegistry : dev.abdulkadirozyurt.srtla.sender.Reader
     fun restartCount(): Int = restarts.get()
 }
 
+
+private fun reg3Packet(): ByteArray =
+    byteArrayOf((SRTLA_TYPE_REG3 shr 8).toByte(), (SRTLA_TYPE_REG3 and 0xff).toByte())

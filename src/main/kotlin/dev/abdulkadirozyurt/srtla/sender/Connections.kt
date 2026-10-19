@@ -26,7 +26,7 @@ fun uplinkLabel(receiverHost: String, receiverPort: Int, ip: InetAddress): Strin
 
 /**
  * Apply a queued reload: remove links whose IP is gone, re-weight the links that
- * stay, and dial the new ones.
+ * stay, and dial the new ones. Returns the links it added.
  */
 fun applyConnectionChanges(
     state: SenderState,
@@ -35,7 +35,7 @@ fun applyConnectionChanges(
     receiverHost: String,
     receiverPort: Int,
     binder: UplinkBinder,
-) {
+): List<SrtlaConnection> {
     val connections = state.connections
     val currentLabels = connections.map { it.label }.toHashSet()
     val desiredLabels = newIps.map { uplinkLabel(receiverHost, receiverPort, it) }.toHashSet()
@@ -63,15 +63,15 @@ fun applyConnectionChanges(
         needIps.add(ip)
         needWeights.add(weightFor(newIps, newWeights, ip))
     }
-    if (needIps.isNotEmpty()) {
-        val added = createConnectionsFromIps(needIps, needWeights, receiverHost, receiverPort, binder, state.connIo)
-        connections.addAll(added)
-        if (added.isNotEmpty()) {
-            log.info("added ${added.size} new connections")
-        } else {
-            log.warning("failed to add any new connections (attempted ${needIps.size})")
-        }
+    if (needIps.isEmpty()) return emptyList()
+    val added = createConnectionsFromIps(needIps, needWeights, receiverHost, receiverPort, binder, state.connIo)
+    connections.addAll(added)
+    if (added.isNotEmpty()) {
+        log.info("added ${added.size} new connections")
+    } else {
+        log.warning("failed to add any new connections (attempted ${needIps.size})")
     }
+    return added
 }
 
 /** Weight for [ip] from the parallel lists (first match wins); 1 when absent. */

@@ -380,13 +380,16 @@ class SrtlaSender(
         if (!hub.isEmpty()) hub.publish("stats", stats.get().toJsonValue())
 
         val changes = state.pendingChanges
+        var added: List<SrtlaConnection> = emptyList()
         if (changes != null) {
             state.pendingChanges = null
             log.info("applying queued connection changes: ${changes.newIps.size} IPs")
-            applyConnectionChanges(state, changes.newIps, changes.newWeights, changes.receiverHost, changes.receiverPort, binder)
+            added = applyConnectionChanges(state, changes.newIps, changes.newWeights, changes.receiverHost, changes.receiverPort, binder)
             log.info("connection changes applied successfully")
         }
         readers.syncReaders(connections, state.connIo)
+        // After syncReaders, so the new links already have readers for their REG3.
+        if (added.isNotEmpty()) registerAddedUplinks(state, added, now)
     }
 
     private fun shutdown() {

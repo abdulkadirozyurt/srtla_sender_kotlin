@@ -3,6 +3,7 @@
 package dev.abdulkadirozyurt.srtla.sender
 
 import dev.abdulkadirozyurt.srtla.connection.STARTUP_GRACE_MS
+import dev.abdulkadirozyurt.srtla.connection.SrtlaConnection
 import dev.abdulkadirozyurt.srtla.core.satSub
 import java.io.IOException
 import java.util.logging.Logger
@@ -127,6 +128,27 @@ fun handleRegistrationWake(state: SenderState, nowMs: Long, readers: ReaderRegis
     expireReg2Wait(state, nowMs, readers)
     finishProbingIfDue(state, nowMs)
     sendRegistration(state, nowMs, readers)
+}
+
+/**
+ * Register links added mid-session at once. A new link gets the startup grace
+ * meant for the first registration, so it sat 5 s before its first REG2. With a
+ * group in place a REG2 is all it needs. This matters most when every other
+ * link is gone: the receiver drops an idle SRT peer after ~5 s, so a link that
+ * waits out the grace comes back too late to save the stream.
+ */
+fun registerAddedUplinks(state: SenderState, added: List<SrtlaConnection>, nowMs: Long) {
+    val reg = state.reg
+    // No group yet, or initial registration owns the handshake: leave it to the driver.
+    if (!reg.hasConnected || reg.pendingReg2Idx() != null || reg.reg1TargetIdx != null) return
+    for (conn in added) {
+        val idx = state.connections.indexOf(conn)
+        if (idx < 0) continue
+        conn.reconnection.startupGraceDeadlineMs = 0L
+        // Later retries follow the normal pacing from here.
+        conn.recordReconnectAttempt(nowMs)
+        sendOn(state, conn, reg.buildReg2(idx), nowMs, "REG2", idx)
+    }
 }
 
 /**
