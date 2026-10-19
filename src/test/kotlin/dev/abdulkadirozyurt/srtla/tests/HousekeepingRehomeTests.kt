@@ -117,6 +117,45 @@ fun registerHousekeepingRehomeTests() {
             assertEquals(RegistrationEvent.REG3, state.reg.processRegistrationPacket(0, reg3Packet(), now))
         }
 
+        test("an_unanswered_reg1_moves_to_the_next_uplink") {
+            val now = nowMs()
+            val connections = createTestConnections(2, now)
+            val state = SenderState(
+                connections = connections,
+                connIo = createTestConnIoMap(connections),
+                reg = RegistrationManager(),
+            )
+            for (conn in connections) conn.connected = false
+            // REG1 to uplink 0 goes unanswered: the REG2 wait is 1000 ms.
+            state.reg.buildReg1For(0, now)
+
+            try {
+                handleHousekeeping(state, "127.0.0.1", false, now + 1500, NoopReaderRegistry)
+            } catch (_: AllLinksFailedException) {
+            }
+
+            assertEquals(1, state.reg.reg1TargetIdx, "the retry goes to the other uplink")
+        }
+
+        test("a_single_uplink_keeps_its_reg1_target") {
+            val now = nowMs()
+            val connections = createTestConnections(1, now)
+            val state = SenderState(
+                connections = connections,
+                connIo = createTestConnIoMap(connections),
+                reg = RegistrationManager(),
+            )
+            for (conn in connections) conn.connected = false
+            state.reg.buildReg1For(0, now)
+
+            try {
+                handleHousekeeping(state, "127.0.0.1", false, now + 1500, NoopReaderRegistry)
+            } catch (_: AllLinksFailedException) {
+            }
+
+            assertEquals(0, state.reg.reg1TargetIdx, "with one uplink the retry stays on it")
+        }
+
         test("an_uplink_added_before_the_first_registration_waits_for_the_driver") {
             val state = SenderState(reg = RegistrationManager())
             val now = nowMs()

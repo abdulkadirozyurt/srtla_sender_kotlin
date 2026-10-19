@@ -165,13 +165,20 @@ private fun finishProbingIfDue(state: SenderState, nowMs: Long) {
 }
 
 /**
- * On a REG2 wait expiry during initial registration, rebind the target uplink to
- * a fresh socket (new source port) so the next REG1 leaves on a new flow.
+ * On a REG2 wait expiry during initial registration, rebind the expired uplink to
+ * a fresh socket (new source port). With more than one uplink, the next REG1 moves
+ * to the next uplink: a REG1 path that went unanswered tends to stay unanswered
+ * (field data: 10-20 s stuck on one uplink).
  */
 private fun expireReg2Wait(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
     val reg = state.reg
     val idx = reg.clearPendingIfTimedOut(nowMs) ?: return
     if (reg.activeConnections != 0) return
+    if (state.connections.size > 1) {
+        val next = (idx + 1) % state.connections.size
+        reg.setReg1TargetIdx(next)
+        log.info("REG1 retry moves from uplink #$idx to #$next")
+    }
     val conn = state.connections.getOrNull(idx) ?: return
     val io = state.connIo[conn.connId] ?: return
     log.info("REG1 retry #${reg.reg1Attempts + 1} on fresh socket (wait ${reg.nextReg2WaitMs()}ms)")

@@ -2,6 +2,8 @@
 // Source: crates/srtla-core/src/selection/mod.rs, enhanced.rs, classifier.rs
 package dev.abdulkadirozyurt.srtla.tests
 
+import dev.abdulkadirozyurt.srtla.connection.LINK_WEIGHT_FULL_ABOVE_WINDOW
+import dev.abdulkadirozyurt.srtla.connection.LINK_WEIGHT_NONE_AT_OR_BELOW_WINDOW
 import dev.abdulkadirozyurt.srtla.core.ConfigSnapshot
 import dev.abdulkadirozyurt.srtla.core.SchedulingMode
 import dev.abdulkadirozyurt.srtla.core.nowMs
@@ -390,6 +392,37 @@ fun registerSelectionTests() {
             c.bitrate.currentBitrateBps = 500_000.0
             val m = ccSoftCapMultiplier(c)
             assertClose(0.5, m, 0.01, "got $m")
+        }
+
+        test("test_enhanced_link_weight_favours_the_weighted_link") {
+            // Identical links: index 0 wins the tie unweighted. The weight-5 link at
+            // a full-weight window must take the packet instead.
+            val conns = createTestConnections(2)
+            for (c in conns) {
+                c.window = LINK_WEIGHT_FULL_ABOVE_WINDOW + 1000
+                c.inFlightPackets = 10
+            }
+            conns[1].linkWeight = 5
+
+            val result = selectEnhanced(conns, null, nowMs(), false)
+            assertEquals(1, result, "operator weight must favour the weighted link at full weight")
+        }
+
+        test("test_enhanced_link_weight_is_ignored_at_small_window") {
+            // At or below LINK_WEIGHT_NONE_AT_OR_BELOW_WINDOW the multiplier is 1.0,
+            // so a weighted link must select exactly as an unweighted one does.
+            val now = nowMs()
+            fun pair(weight: Int) = createTestConnections(2, now).also { list ->
+                for (c in list) {
+                    c.window = LINK_WEIGHT_NONE_AT_OR_BELOW_WINDOW
+                    c.inFlightPackets = 10
+                }
+                list[1].linkWeight = weight
+            }
+
+            val unweighted = selectEnhanced(pair(1), null, now, false)
+            val weighted = selectEnhanced(pair(5), null, now, false)
+            assertEquals(unweighted, weighted, "weight must be ignored at a small window")
         }
     }
 

@@ -215,7 +215,9 @@ fun selectEnhanced(conns: List<SrtlaConnection>, lastIdx: Int?, currentTimeMs: L
         // Weak links left here are weak for share reasons only: crush, keep rankable.
         val gateMult = if (anyUnconstrained && c.weak) GATED_LINK_PENALTY else 1.0
         // Phase weight de-rates a warming link; the ramp de-rates a rejoining one.
-        val base = c.getScore().toDouble() * c.phaseWeight() * c.rejoinRampMultiplier(currentTimeMs)
+        // The operator weight (1..10) favours a link once its window is large.
+        val weightMult = if (c.linkWeight > 1) c.weightMultiplier().toDouble() else 1.0
+        val base = c.getScore().toDouble() * c.phaseWeight() * c.rejoinRampMultiplier(currentTimeMs) * weightMult
         val capMult = ccSoftCapMultiplier(c)
         val score = if (!enableQuality) {
             base * capMult * gateMult
