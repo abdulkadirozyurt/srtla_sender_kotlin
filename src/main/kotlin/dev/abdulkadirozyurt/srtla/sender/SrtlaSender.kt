@@ -83,6 +83,15 @@ class SrtlaSender(
     @Volatile var registeredLinks: Int = 0
         private set
 
+    /**
+     * SRT packets from the server handed to the local client (ACK, NAK, keepalive,
+     * shutdown). A count that stops growing while the client sends means the
+     * server-side SRT session is gone, even when the SRTLA links are up. Written
+     * only by the event-loop thread; safe to read from any thread.
+     */
+    @Volatile var serverPacketsToClient: Long = 0
+        private set
+
     /** Owned by the event-loop thread; never touch it from another thread while running. */
     val state: SenderState = SenderState(rehome = RehomeGate(config.rehomeOnFailure()))
 
@@ -304,6 +313,7 @@ class SrtlaSender(
     }
 
     private fun sendToClient(data: ByteArray, len: Int, addr: SocketAddress) {
+        serverPacketsToClient++
         val l = listener ?: return
         if (pendingClient.isEmpty()) {
             try {

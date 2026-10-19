@@ -158,9 +158,11 @@ fun registerE2ETests() {
                 h.sendFromClient(e2eSrtData(7)) // teaches the sender the client address
                 assertTrue(h.receiver.pollUntil { h.receiver.distinctSeqCount() >= 1 })
                 h.drainClient(200)
+                val before = h.sender.serverPacketsToClient
                 h.receiver.sendSrtAck(7, timestamp = 1234)
                 val acks = h.drainClient(600).filter { getType(it) == 0x8002 }
                 assertEquals(1, acks.size, "copies of one ACK must be relayed once, got ${acks.size}")
+                assertTrue(h.sender.serverPacketsToClient > before, "relayed server packets are counted")
             }
         }
 
