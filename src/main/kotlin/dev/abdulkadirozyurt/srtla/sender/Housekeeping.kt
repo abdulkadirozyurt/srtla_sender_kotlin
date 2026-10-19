@@ -35,18 +35,7 @@ fun handleHousekeeping(
     val connections = state.connections
     val reg = state.reg
     expireReg2Wait(state, nowMs, readers)
-
-    if (reg.isProbing()) {
-        reg.checkProbingComplete(nowMs)
-        if (!reg.isProbing()) {
-            val idx = reg.getSelectedConnectionIdx()
-            val conn = idx?.let { connections.getOrNull(it) }
-            if (conn != null) {
-                conn.reconnection.startupGraceDeadlineMs = nowMs + STARTUP_GRACE_MS
-                log.fine { "${conn.label}: Reset grace period after being selected for initial registration" }
-            }
-        }
-    }
+    finishProbingIfDue(state, nowMs)
 
     for ((i, conn) in connections.withIndex()) {
         if (conn.isTimedOut(nowMs)) {
@@ -136,7 +125,21 @@ fun handleHousekeeping(
  */
 fun handleRegistrationWake(state: SenderState, nowMs: Long, readers: ReaderRegistry) {
     expireReg2Wait(state, nowMs, readers)
+    finishProbingIfDue(state, nowMs)
     sendRegistration(state, nowMs, readers)
+}
+
+/**
+ * End RTT probing when every probe answered or the probe timeout passed, and give
+ * the chosen link the startup grace. Runs from the registration wake, so REG1
+ * leaves in the same pass instead of on the next 1 s housekeeping tick.
+ */
+private fun finishProbingIfDue(state: SenderState, nowMs: Long) {
+    val reg = state.reg
+    if (!reg.isProbing() || !reg.checkProbingComplete(nowMs)) return
+    val conn = reg.getSelectedConnectionIdx()?.let { state.connections.getOrNull(it) } ?: return
+    conn.reconnection.startupGraceDeadlineMs = nowMs + STARTUP_GRACE_MS
+    log.fine { "${conn.label}: Reset grace period after being selected for initial registration" }
 }
 
 /**

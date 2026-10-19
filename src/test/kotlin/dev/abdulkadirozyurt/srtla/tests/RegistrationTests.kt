@@ -12,6 +12,7 @@ import dev.abdulkadirozyurt.srtla.protocol.SRTLA_TYPE_REG_NGP
 import dev.abdulkadirozyurt.srtla.protocol.SRTLA_TYPE_REG3
 import dev.abdulkadirozyurt.srtla.protocol.createReg2Packet
 import dev.abdulkadirozyurt.srtla.protocol.writeU16BE
+import dev.abdulkadirozyurt.srtla.registration.PROBE_TIMEOUT_MS
 import dev.abdulkadirozyurt.srtla.registration.RegistrationEvent
 import dev.abdulkadirozyurt.srtla.registration.RegistrationManager
 import dev.abdulkadirozyurt.srtla.testkit.assertEquals
@@ -336,6 +337,36 @@ fun registerRegistrationTests() {
 
             assertNull(sends.reg1, "no REG1 until probing completes")
             assertTrue(reg.isProbing())
+        }
+
+        test("probing_wakes_the_driver_at_the_probe_timeout") {
+            val reg = RegistrationManager()
+            val connections = mutableListOf(createTestConnection(), createTestConnection())
+            val now = nowMs()
+
+            reg.startProbing(connections, now)
+
+            assertEquals(now + PROBE_TIMEOUT_MS, reg.nextWakeAtMs(), "the select loop wakes at the probe deadline")
+            assertFalse(reg.checkProbingComplete(now + PROBE_TIMEOUT_MS - 1), "still waiting before the deadline")
+            assertTrue(reg.checkProbingComplete(now + PROBE_TIMEOUT_MS), "no answers: done at the deadline")
+            assertEquals(0, reg.reg1TargetIdx, "no answers: first link")
+            assertNotNull(reg.regDriverPendingSends(connections.size, now + PROBE_TIMEOUT_MS).reg1, "REG1 in the same pass")
+        }
+
+        test("last_probe_answer_wakes_the_driver_at_once") {
+            val reg = RegistrationManager()
+            val connections = mutableListOf(createTestConnection(), createTestConnection())
+            val now = nowMs()
+
+            reg.startProbing(connections, now)
+            reg.handleProbeResponse(1, now + 30)
+            assertEquals(now + PROBE_TIMEOUT_MS, reg.nextWakeAtMs(), "one answer missing: keep the deadline")
+
+            reg.handleProbeResponse(0, now + 50)
+            assertEquals(now + 50, reg.nextWakeAtMs(), "all answered: wake now")
+            assertTrue(reg.checkProbingComplete(now + 50))
+            assertEquals(1, reg.reg1TargetIdx, "lowest RTT wins")
+            assertNotNull(reg.regDriverPendingSends(connections.size, now + 50).reg1, "REG1 in the same pass")
         }
 
         test("single_uplink_skips_probing_and_sends_reg1_now") {

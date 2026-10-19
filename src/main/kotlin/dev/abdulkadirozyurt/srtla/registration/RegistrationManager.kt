@@ -40,6 +40,14 @@ private fun randomId(): ByteArray = ByteArray(SRTLA_ID_LEN).also { rng.nextBytes
  */
 private val REG2_CONN_WAITS_MS = longArrayOf(500L, 1000L, 2000L, REG3_TIMEOUT * 1000L)
 
+/**
+ * How long multi-uplink startup waits for REG2 probe answers before choosing the
+ * REG1 link. Cellular answers arrive within a few hundred ms; a receiver that
+ * never answers costs this wait on every start. A late link is still used once
+ * registered, only the first choice skips it.
+ */
+const val PROBE_TIMEOUT_MS: Long = 800L
+
 /** REG2(conn) sends per uplink before the registration restarts: initial send + 3 retries. */
 private const val REG2_CONN_MAX_SENDS = 4
 
@@ -463,6 +471,8 @@ class RegistrationManager {
         if (activeConnections == 0) {
             reg3Retries.values.minOfOrNull { it.deadlineMs }?.let { wakes.add(it) }
         }
+        // Probing ends on its own deadline, not on the 1 s housekeeping tick.
+        if (probingState == ProbingState.WAITING_FOR_PROBES) wakes.add(pendingTimeoutAtMs)
         return wakes.minOrNull()
     }
 
@@ -499,7 +509,7 @@ class RegistrationManager {
         }
         if (probeResults.isNotEmpty()) {
             probingState = ProbingState.WAITING_FOR_PROBES
-            pendingTimeoutAtMs = now + 2000L
+            pendingTimeoutAtMs = now + PROBE_TIMEOUT_MS
             log.info("Waiting for probe responses from ${probeResults.size} connections")
         } else {
             log.warning("No connections available for probing - using first connection as fallback")
@@ -515,10 +525,12 @@ class RegistrationManager {
             val rtt = now.satSub(r.probeSentMs)
             r.rttMs = rtt
             log.info("Probe response from connection #$connIdx (RTT: ${rtt}ms)")
+            // Last answer in: finish on the next driver pass instead of waiting out the timeout.
+            if (probeResults.all { it.rttMs != null }) pendingTimeoutAtMs = now
         }
     }
 
-    /** Finish probing once every probe answered or the 2 s timeout passed. */
+    /** Finish probing once every probe answered or [PROBE_TIMEOUT_MS] passed. */
     fun checkProbingComplete(now: Long = nowMs()): Boolean {
         if (probingState != ProbingState.WAITING_FOR_PROBES) return false
         val allResponded = probeResults.all { it.rttMs != null }
@@ -566,6 +578,6 @@ class RegistrationManager {
 
     fun setProbingStateWaiting(now: Long = nowMs()) {
         probingState = ProbingState.WAITING_FOR_PROBES
-        pendingTimeoutAtMs = now + 2000L
+        pendingTimeoutAtMs = now + PROBE_TIMEOUT_MS
     }
 }
