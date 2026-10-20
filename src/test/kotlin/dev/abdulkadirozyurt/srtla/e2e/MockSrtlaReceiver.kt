@@ -31,6 +31,8 @@ class MockSrtlaReceiver {
 
     /** Group ids this receiver minted (REG2 replies). */
     private val mintedIds = ArrayList<ByteArray>()
+    /** Source host of every REG1 received, in order, including dropped ones. */
+    private val reg1Sources = ArrayList<String>()
     /** Uplink source addresses that completed REG3. */
     private val registered = LinkedHashSet<SocketAddress>()
     /** Distinct SRT data sequences received. */
@@ -48,6 +50,9 @@ class MockSrtlaReceiver {
 
     /** When false, drop every inbound packet (simulates a dead receiver). */
     @Volatile var answering: Boolean = true
+
+    /** Drop the first REG1 the receiver sees, to model an unanswered REG1 path. */
+    @Volatile var dropFirstReg1: Boolean = false
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -101,6 +106,11 @@ class MockSrtlaReceiver {
     private fun handleReg1(data: ByteArray, from: SocketAddress) {
         if (data.size < 2 + SRTLA_ID_LEN) return
         reg1Received.incrementAndGet()
+        val count = synchronized(lock) {
+            reg1Sources.add((from as InetSocketAddress).address.hostAddress)
+            reg1Sources.size
+        }
+        if (dropFirstReg1 && count == 1) return
         val id = data.copyOfRange(2, 2 + SRTLA_ID_LEN)
         for (i in SRTLA_ID_LEN / 2 until SRTLA_ID_LEN) id[i] = (id[i].toInt() xor 0x55).toByte()
         synchronized(lock) { mintedIds.add(id) }
@@ -144,6 +154,8 @@ class MockSrtlaReceiver {
     fun registeredUplinkAddresses(): List<SocketAddress> = synchronized(lock) { registered.toList() }
 
     fun registeredCount(): Int = synchronized(lock) { registered.size }
+
+    fun reg1SourceHosts(): List<String> = synchronized(lock) { reg1Sources.toList() }
 
     fun distinctSeqCount(): Int = synchronized(lock) { seenSeqs.size }
 

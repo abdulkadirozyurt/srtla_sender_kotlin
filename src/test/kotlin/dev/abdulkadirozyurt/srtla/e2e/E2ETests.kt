@@ -56,8 +56,12 @@ private fun e2eSrtData(seq: Int): ByteArray {
 private class E2EHarness(
     uplinks: List<String> = listOf("127.0.0.1", "127.0.0.2"),
     mode: SchedulingMode = SchedulingMode.ENHANCED,
+    configureReceiver: (MockSrtlaReceiver) -> Unit = {},
 ) : AutoCloseable {
-    val receiver = MockSrtlaReceiver().also { it.start() }
+    val receiver = MockSrtlaReceiver().also {
+        configureReceiver(it)
+        it.start()
+    }
     val config = DynamicConfig(mode = mode)
     val stats = SharedStats()
     val hub = SubscriptionHub()
@@ -134,6 +138,18 @@ fun registerE2ETests() {
                 assertTrue(h.receiver.pollUntilRegistered(uplinks.size), "registered=${h.receiver.registeredCount()}")
                 assertTrue(h.receiver.regNgpSent.get() >= 1, "the RTT probe must be answered with REG_NGP")
                 assertEquals(1, h.receiver.reg1Received.get(), "exactly one REG1 starts the group")
+            }
+        }
+
+        test("an unanswered REG1 retries on the other uplink") {
+            // Rotation needs two loopback uplinks; a single-uplink host cannot show it.
+            if (uplinks.size < 2) return@test
+            E2EHarness(uplinks, configureReceiver = { it.dropFirstReg1 = true }).use { h ->
+                assertTrue(h.awaitStarted(), "sender did not start: ${h.failure}")
+                assertTrue(h.receiver.pollUntilRegistered(uplinks.size, 10_000), "registered=${h.receiver.registeredCount()}")
+                val hosts = h.receiver.reg1SourceHosts()
+                assertTrue(hosts.size >= 2, "expected a retried REG1, got $hosts")
+                assertTrue(hosts[1] != hosts[0], "second REG1 must use the other uplink: $hosts")
             }
         }
 
